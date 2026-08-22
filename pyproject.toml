@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jacknet"
+version = "0.3.2"
+description = "Adaptive LAN inventory, discovery, and device fingerprinting CLI"
+requires-python = ">=3.11"
+dependencies = [
+  "typer>=0.12",
+  "rich>=13.7",
+  "psutil>=5.9",
+  "scapy>=2.5",
+  "zeroconf>=0.132",
+  "mac-vendor-lookup>=0.1.12",
+]
+
+[project.scripts]
+jacknet = "jacknet.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jacknet"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 120
