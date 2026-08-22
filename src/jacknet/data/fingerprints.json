@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {"field":"manufacturer","needle":"sony interactive","label":"Sony PlayStation","kind":"game_console","score":45},
+    {"field":"manufacturer","needle":"sony","label":"Sony device","kind":"consumer_electronics","score":20},
+    {"field":"hostname","needle":"ps5","label":"Sony PlayStation 5","kind":"game_console","score":50},
+    {"field":"hostname","needle":"ps4","label":"Sony PlayStation 4","kind":"game_console","score":50},
+    {"field":"hostname","needle":"xbox","label":"Microsoft Xbox","kind":"game_console","score":50},
+    {"field":"manufacturer","needle":"nintendo","label":"Nintendo console","kind":"game_console","score":45},
+    {"field":"manufacturer","needle":"apple","label":"Apple device","kind":"computer_or_mobile","score":30},
+    {"field":"manufacturer","needle":"lenovo","label":"Lenovo computer","kind":"computer","score":35},
+    {"field":"manufacturer","needle":"dell","label":"Dell computer","kind":"computer","score":35},
+    {"field":"manufacturer","needle":"hewlett","label":"HP computer/printer","kind":"computer_or_printer","score":30},
+    {"field":"manufacturer","needle":"brother","label":"Brother device","kind":"computer_or_printer","score":30},
+    {"field":"manufacturer","needle":"samsung","label":"Samsung device","kind":"consumer_electronics","score":25},
+    {"field":"manufacturer","needle":"roku","label":"Roku","kind":"streaming_device","score":45},
+    {"field":"manufacturer","needle":"raspberry","label":"Raspberry Pi","kind":"single_board_computer","score":45},
+    {"field":"manufacturer","needle":"espressif","label":"Espressif device","kind":"iot","score":30},
+    {"field":"manufacturer","needle":"ubiquiti","label":"Ubiquiti network device","kind":"network_device","score":35},
+    {"field":"manufacturer","needle":"netgear","label":"NETGEAR network device","kind":"network_device","score":30},
+    {"field":"manufacturer","needle":"tp-link","label":"TP-Link network device","kind":"network_device","score":30},
+    {"field":"hostname","needle":"chromecast","label":"Google Chromecast","kind":"streaming_device","score":50},
+    {"field":"hostname","needle":"iphone","label":"Apple iPhone","kind":"phone","score":45},
+    {"field":"hostname","needle":"ipad","label":"Apple iPad","kind":"tablet","score":45},
+    {"field":"hostname","needle":"printer","label":"Network printer","kind":"printer","score":35}
+  ]
+}
