@@ -109,12 +109,44 @@ def learn():
                             (fid,ft,val,weight,n))
     return {"examples":len(examples),"created":created,"updated":updated,"promoted":promoted}
 
+def _apply_exact_confirmation(device: Device) -> bool:
+    """Apply a user-confirmed identity for this exact MAC before generalized learning.
+
+    This is intentionally stronger than inferred fingerprints. It lets devices
+    with private/randomized MACs retain a confirmed identity even when OUI data
+    is unavailable.
+    """
+    if not device.mac:
+        return False
+    try:
+        with connect() as con:
+            row=con.execute("""SELECT d.manufacturer,d.user_label,d.model,d.device_type
+                FROM devices d
+                WHERE d.canonical_mac=? AND EXISTS(
+                    SELECT 1 FROM labels l WHERE l.device_id=d.device_id
+                )
+                LIMIT 1""", (device.mac,)).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    man,user_label,model,typ=row
+    device.manufacturer = man or device.manufacturer
+    device.model = user_label or model or device.model
+    device.device_type = typ or device.device_type
+    device.confidence = max(device.confidence, 99)
+    device.evidence.append(Evidence("confirmed", "mac", device.mac, 100))
+    return True
+
 def apply_learned(device: Device) -> Device:
-    """Apply active learned fingerprints. Multiple matching features reinforce a conclusion."""
+    """Apply exact confirmations first, then active learned fingerprints."""
     try: migrate()
     except Exception: return device
+
+    exact = _apply_exact_confirmation(device)
     feats=device_features(device)
-    if not feats: return device
+    if not feats:
+        return device
     scores=defaultdict(float); matches=defaultdict(list)
     with connect() as con:
         rows=con.execute("""SELECT f.id,f.model,f.device_type,ff.feature_type,ff.pattern,ff.weight
@@ -129,6 +161,6 @@ def apply_learned(device: Device) -> Device:
     if len(ms)<2 and score<20: return device
     for ft,pat,w in ms: device.evidence.append(Evidence("learned",ft,pat,int(w)))
     learned_conf=min(95, 55 + int(score))
-    if learned_conf > device.confidence:
+    if not exact and learned_conf > device.confidence:
         device.model=model or device.model; device.device_type=typ or device.device_type; device.confidence=learned_conf
     return device
