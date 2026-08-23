@@ -3,6 +3,7 @@ import ipaddress
 import socket
 import subprocess
 import shutil
+import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -12,12 +13,46 @@ from .models import Device
 from .mac import annotate_mac_facts
 
 
+def _explicit_cli_target() -> str | None:
+    """Return a single explicit CLI target when JackNet is doing a one-host operation.
+
+    This keeps `jacknet explain <ip>` and `jacknet scan -ip <ip>` from ARP-scanning
+    an entire LAN before filtering down to one host.
+    """
+    args = sys.argv[1:]
+    if not args:
+        return None
+
+    if args[0] == "explain" and len(args) >= 2:
+        candidate = args[1]
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            return None
+
+    if args[0] == "scan":
+        for flag in ("-i", "-ip", "--ip"):
+            if flag in args:
+                idx = args.index(flag)
+                if idx + 1 < len(args):
+                    try:
+                        return str(ipaddress.ip_address(args[idx + 1]))
+                    except ValueError:
+                        return None
+    return None
+
+
 def default_network() -> str:
     """Return the IPv4 network for the interface used by the default route.
 
-    Prefer Scapy's route table so VPN/Hyper-V/Docker adapters are less likely to
-    be selected accidentally. Fall back to a sane non-loopback interface.
+    For explicit one-host CLI operations, return a /32 so discovery is targeted.
+    Otherwise prefer Scapy's route table so VPN/Hyper-V/Docker adapters are less
+    likely to be selected accidentally, with a non-loopback fallback.
     """
+    target = _explicit_cli_target()
+    if target:
+        return f"{target}/32"
+
     try:
         from scapy.all import conf
         iface, src_ip, _ = conf.route.route("1.1.1.1")
