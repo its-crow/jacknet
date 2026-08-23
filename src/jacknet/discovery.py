@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 import psutil
 from .models import Device
+from .mac import annotate_mac_facts
 
 
 def default_network() -> str:
@@ -40,7 +41,10 @@ def arp_scan(network: str, timeout: float = 1.5) -> list[Device]:
         raise RuntimeError(f"Scapy unavailable: {exc}") from exc
     ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=network), timeout=timeout, verbose=False)
     now = datetime.now(timezone.utc).isoformat()
-    return [Device(ip=r.psrc, mac=r.hwsrc.lower(), first_seen=now, last_seen=now) for _, r in ans]
+    devices = [Device(ip=r.psrc, mac=r.hwsrc.lower(), first_seen=now, last_seen=now) for _, r in ans]
+    annotate_mac_facts(devices)
+    devices.sort(key=lambda d: ipaddress.ip_address(d.ip))
+    return devices
 
 
 def ptr_name(ip: str) -> str | None:
