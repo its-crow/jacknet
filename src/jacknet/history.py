@@ -15,23 +15,44 @@ def record(devices: list[Device], path: Path | None = None):
         for d in devices:
             device_id = None
             if d.mac:
-                row = con.execute("SELECT device_id FROM devices WHERE canonical_mac=?", (d.mac,)).fetchone()
+                row = con.execute("SELECT device_id FROM devices WHERE canonical_mac=?", (d.mac.lower(),)).fetchone()
                 if row:
                     device_id = row[0]
-                    con.execute("UPDATE devices SET last_seen=?, manufacturer=?, model=?, device_type=?, confidence=? WHERE device_id=?",
+                    con.execute("UPDATE devices SET last_seen=?, manufacturer=COALESCE(?,manufacturer), model=COALESCE(?,model), device_type=COALESCE(?,device_type), confidence=MAX(confidence,?) WHERE device_id=?",
                                 (now, d.manufacturer, d.model, d.device_type, d.confidence, device_id))
                 else:
                     cur = con.execute("INSERT INTO devices(canonical_mac,first_seen,last_seen,manufacturer,model,device_type,confidence) VALUES(?,?,?,?,?,?,?)",
-                                      (d.mac, now, now, d.manufacturer, d.model, d.device_type, d.confidence))
+                                      (d.mac.lower(), now, now, d.manufacturer, d.model, d.device_type, d.confidence))
                     device_id = cur.lastrowid
+            elif d.ip:
+                row = con.execute("SELECT device_id FROM device_addresses WHERE ip=? ORDER BY last_seen DESC LIMIT 1", (d.ip,)).fetchone()
+                if row: device_id = row[0]
+
             cur = con.execute("""INSERT INTO observations
                 (device_id, observed_at, ip, mac, hostname, manufacturer, model, device_type, os, confidence, payload)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (device_id, now, d.ip, d.mac, d.hostname, d.manufacturer, d.model, d.device_type, d.os, d.confidence, json.dumps(d.to_dict())))
             observation_id = cur.lastrowid
+
+            if device_id is not None and d.ip:
+                row = con.execute("SELECT id,observation_count FROM device_addresses WHERE device_id=? AND ip=?", (device_id,d.ip)).fetchone()
+                if row:
+                    con.execute("UPDATE device_addresses SET last_seen=?,observation_count=?,source='scan' WHERE id=?", (now,int(row[1])+1,row[0]))
+                else:
+                    con.execute("INSERT INTO device_addresses(device_id,ip,first_seen,last_seen,observation_count,source) VALUES(?,?,?,?,1,'scan')", (device_id,d.ip,now,now))
+
             for e in d.evidence:
                 con.execute("INSERT INTO features(observation_id,feature_type,feature_value,source) VALUES(?,?,?,?)",
-                            (observation_id, e.source, e.fact, e.source))
+                            (observation_id, e.fact, e.value, e.source))
+                if device_id is not None:
+                    con.execute("INSERT INTO device_features(device_id,observed_at,feature_type,feature_value,source) VALUES(?,?,?,?,?)",
+                                (device_id,now,e.fact,str(e.value),e.source))
+            if device_id is not None:
+                if d.hostname:
+                    con.execute("INSERT INTO device_features(device_id,observed_at,feature_type,feature_value,source) VALUES(?,?,?,?,?)",(device_id,now,'hostname',d.hostname,'scan'))
+                for p in d.open_ports:
+                    if p.get('port'):
+                        con.execute("INSERT INTO device_features(device_id,observed_at,feature_type,feature_value,source) VALUES(?,?,?,?,?)",(device_id,now,'open_port',str(p['port']),'nmap'))
 
 
 def latest(path: Path | None = None, limit: int = 100):
