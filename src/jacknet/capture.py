@@ -14,6 +14,7 @@ from typing import Iterable
 
 from .db import connect, migrate
 from .evidence import ingest_full_decode
+from .network_context import ensure_network
 
 TSHARK_FIELDS=["frame.time_epoch","frame.len","eth.src","eth.dst","ip.src","ip.dst","ipv6.src","ipv6.dst","tcp.srcport","tcp.dstport","udp.srcport","udp.dstport","_ws.col.Protocol","dns.qry.name","dns.resp.name","tls.handshake.extensions_server_name","http.host","dhcp.option.hostname","bootp.option.hostname","ssdp.server","ssdp.usn","wlan.sa","wlan.da","radiotap.dbm_antsignal"]
 
@@ -102,53 +103,50 @@ def _usable_mac(mac):
     try:return mac.lower()!="ff:ff:ff:ff:ff:ff" and not (int(mac.split(":")[0],16)&1)
     except (ValueError,IndexError):return False
 
-def _find_or_create_device(con,mac,ip,observed_at):
-    # If a real MAC is present it is authoritative. Never merge an unknown MAC into a device merely because an IP was reused.
+def _find_or_create_device(con,network_id,mac,ip,observed_at):
     if _usable_mac(mac):
         row=con.execute("SELECT device_id FROM devices WHERE lower(canonical_mac)=lower(?)",(mac,)).fetchone()
         if row:
             did=int(row[0]);con.execute("UPDATE devices SET last_seen=? WHERE device_id=?",(observed_at,did));return did
         cur=con.execute("INSERT INTO devices(canonical_mac,first_seen,last_seen,confidence) VALUES(?,?,?,0)",(mac,observed_at,observed_at));return int(cur.lastrowid)
-    # Without a usable MAC we may resolve an already-known IP, but never invent an anonymous device from an IP alone.
     if _is_local_ip(ip):
-        row=con.execute("SELECT device_id FROM device_addresses WHERE ip=? ORDER BY last_seen DESC LIMIT 1",(ip,)).fetchone()
+        row=con.execute("SELECT device_id FROM device_network_addresses WHERE network_id=? AND ip=? ORDER BY last_seen DESC LIMIT 1",(network_id,ip)).fetchone()
         if row:return int(row[0])
     return None
-
-def _touch_address(con,did,ip,when,source):
+def _touch_address(con,network_id,did,ip,when,source):
     if not _is_local_ip(ip):return
-    row=con.execute("SELECT id,observation_count FROM device_addresses WHERE device_id=? AND ip=?",(did,ip)).fetchone()
-    if row:con.execute("UPDATE device_addresses SET last_seen=?,observation_count=?,source=? WHERE id=?",(when,int(row[1])+1,source,row[0]))
-    else:con.execute("INSERT INTO device_addresses(device_id,ip,first_seen,last_seen,observation_count,source) VALUES(?,?,?,?,1,?)",(did,ip,when,when,source))
-def _touch_endpoint(con,did,endpoint,when,protocol):
-    row=con.execute("SELECT id,hits FROM device_endpoints WHERE device_id=? AND endpoint=?",(did,endpoint)).fetchone()
+    row=con.execute("SELECT id,observation_count FROM device_network_addresses WHERE network_id=? AND device_id=? AND ip=?",(network_id,did,ip)).fetchone()
+    if row:con.execute("UPDATE device_network_addresses SET last_seen=?,observation_count=?,source=? WHERE id=?",(when,int(row[1])+1,source,row[0]))
+    else:con.execute("INSERT INTO device_network_addresses(network_id,device_id,ip,first_seen,last_seen,observation_count,source) VALUES(?,?,?,?,?,1,?)",(network_id,did,ip,when,when,source))
+def _touch_endpoint(con,network_id,did,endpoint,when,protocol):
+    row=con.execute("SELECT id,hits FROM device_endpoints WHERE device_id=? AND endpoint=? AND network_id IS ?",(did,endpoint,network_id)).fetchone()
     if row:con.execute("UPDATE device_endpoints SET last_seen=?,hits=?,protocol=COALESCE(?,protocol) WHERE id=?",(when,int(row[1])+1,protocol,row[0]))
-    else:con.execute("INSERT INTO device_endpoints(device_id,endpoint,first_seen,last_seen,hits,protocol) VALUES(?,?,?,?,1,?)",(did,endpoint,when,when,protocol))
+    else:con.execute("INSERT INTO device_endpoints(device_id,endpoint,first_seen,last_seen,hits,protocol,network_id) VALUES(?,?,?,?,1,?,?)",(did,endpoint,when,when,protocol,network_id))
 def _packet_owner(rec,src_did,dst_did):
     if _is_local_ip(rec.src_ip):return src_did
     if _is_local_ip(rec.dst_ip):return dst_did
     return src_did or dst_did
 
 def ingest_capture(path:Path,source="pcap",interface=None):
-    migrate();path=path.expanduser().resolve();started=_now();packet_count=0;devices=set();local_ips=set();external_endpoints=set();protocol_counts=defaultdict(int);dns_names=set()
+    migrate();network_id,network=ensure_network();path=path.expanduser().resolve();started=_now();packet_count=0;devices=set();local_ips=set();external_endpoints=set();protocol_counts=defaultdict(int);dns_names=set()
     with connect() as con:
-        cur=con.execute("INSERT INTO capture_sessions(started_at,source,capture_file,interface,packet_count) VALUES(?,?,?,?,0)",(started,source,str(path),interface));session_id=int(cur.lastrowid)
+        cur=con.execute("INSERT INTO capture_sessions(started_at,source,capture_file,interface,packet_count,network_id) VALUES(?,?,?,?,0,?)",(started,source,str(path),interface,network_id));session_id=int(cur.lastrowid)
         for rec in iter_capture(path):
             packet_count+=1
             if rec.protocol:protocol_counts[rec.protocol]+=1
             if rec.dns_name:dns_names.add(rec.dns_name)
-            src_did=_find_or_create_device(con,rec.src_mac,rec.src_ip if _is_local_ip(rec.src_ip) else None,rec.observed_at)
-            dst_did=_find_or_create_device(con,rec.dst_mac,rec.dst_ip if _is_local_ip(rec.dst_ip) else None,rec.observed_at)
+            src_did=_find_or_create_device(con,network_id,rec.src_mac,rec.src_ip if _is_local_ip(rec.src_ip) else None,rec.observed_at)
+            dst_did=_find_or_create_device(con,network_id,rec.dst_mac,rec.dst_ip if _is_local_ip(rec.dst_ip) else None,rec.observed_at)
             for did,ip in ((src_did,rec.src_ip),(dst_did,rec.dst_ip)):
                 if did is not None:
                     devices.add(did)
-                    if _is_local_ip(ip):local_ips.add(ip);_touch_address(con,did,ip,rec.observed_at,source)
+                    if _is_local_ip(ip):local_ips.add(ip);_touch_address(con,network_id,did,ip,rec.observed_at,source)
             owner=_packet_owner(rec,src_did,dst_did)
             if owner is not None:
                 remote=rec.dst_ip if _is_local_ip(rec.src_ip) else rec.src_ip
-                if remote and _host_ip(remote) and not _is_local_ip(remote):external_endpoints.add(remote);_touch_endpoint(con,owner,remote,rec.observed_at,rec.protocol)
-            metadata={"hostname":rec.hostname,"mdns_name":rec.mdns_name,"ssdp_server":rec.ssdp_server,"ssdp_usn":rec.ssdp_usn,"signal_dbm":rec.signal_dbm,"src_device_id":src_did,"dst_device_id":dst_did}
-            con.execute("""INSERT INTO traffic_observations(device_id,session_id,observed_at,source,capture_file,src_ip,dst_ip,src_mac,dst_mac,protocol,src_port,dst_port,dns_name,tls_sni,http_host,bytes,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(owner,session_id,rec.observed_at,source,str(path),rec.src_ip,rec.dst_ip,rec.src_mac,rec.dst_mac,rec.protocol,rec.src_port,rec.dst_port,rec.dns_name,rec.tls_sni,rec.http_host,rec.length,json.dumps(metadata)))
+                if remote and _host_ip(remote) and not _is_local_ip(remote):external_endpoints.add(remote);_touch_endpoint(con,network_id,owner,remote,rec.observed_at,rec.protocol)
+            metadata={"hostname":rec.hostname,"mdns_name":rec.mdns_name,"ssdp_server":rec.ssdp_server,"ssdp_usn":rec.ssdp_usn,"signal_dbm":rec.signal_dbm,"src_device_id":src_did,"dst_device_id":dst_did,"network_id":network_id,"network_key":network.key}
+            con.execute("""INSERT INTO traffic_observations(device_id,session_id,observed_at,source,capture_file,src_ip,dst_ip,src_mac,dst_mac,protocol,src_port,dst_port,dns_name,tls_sni,http_host,bytes,metadata,network_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(owner,session_id,rec.observed_at,source,str(path),rec.src_ip,rec.dst_ip,rec.src_mac,rec.dst_mac,rec.protocol,rec.src_port,rec.dst_port,rec.dns_name,rec.tls_sni,rec.http_host,rec.length,json.dumps(metadata),network_id))
             if owner is not None:
                 features=[]
                 if rec.hostname:features.append(("traffic_hostname",rec.hostname))
@@ -164,7 +162,7 @@ def ingest_capture(path:Path,source="pcap",interface=None):
     if exe and packet_count:
         try:decode_stats.update(ingest_full_decode(path,session_id,exe))
         except Exception as exc:decode_stats["decode_error"]=str(exc)
-    return {"session_id":session_id,"capture":str(path),"packets":packet_count,"devices":len(devices),"local_ips":len(local_ips),"external_endpoints":len(external_endpoints),"dns_names":len(dns_names),"protocols":dict(sorted(protocol_counts.items(),key=lambda kv:kv[1],reverse=True)[:20]),**decode_stats}
+    return {"session_id":session_id,"network_id":network_id,"network":network.name,"network_key":network.key,"capture":str(path),"packets":packet_count,"devices":len(devices),"local_ips":len(local_ips),"external_endpoints":len(external_endpoints),"dns_names":len(dns_names),"protocols":dict(sorted(protocol_counts.items(),key=lambda kv:kv[1],reverse=True)[:20]),**decode_stats}
 def live_capture(interface,output:Path,duration=60,monitor=False):
     exe=dumpcap_path() or tshark_path()
     if not exe:raise RuntimeError("Neither dumpcap nor TShark is available.")
