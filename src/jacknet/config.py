@@ -9,7 +9,7 @@ APP_NAME = "jacknet"
 CONFIG_DIR = Path.home() / ".config" / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_DATA_DIR = Path.home() / ".jacknet"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def load_config() -> dict:
