@@ -40,7 +40,6 @@ def _is_real_lan_interface(description: str) -> bool:
 
 
 def _windows_adapter_info() -> dict[str, dict[str, str]]:
-    """Return real Windows NIC metadata keyed by friendly adapter name."""
     script = "Get-NetAdapter | Select-Object Name,InterfaceDescription,Status,LinkSpeed,MacAddress,InterfaceGuid | ConvertTo-Json -Compress"
     try:
         proc = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
@@ -53,16 +52,13 @@ def _windows_adapter_info() -> dict[str, dict[str, str]]:
 
 
 def _capture_candidates() -> list[dict[str, str]]:
-    win = _windows_adapter_info()
-    rows = []
+    win = _windows_adapter_info(); rows = []
     for num, desc in list_interfaces():
         if not _is_real_lan_interface(desc): continue
-        name = _friendly_capture_name(desc)
-        info = win.get(name, {})
+        name = _friendly_capture_name(desc); info = win.get(name, {})
         rows.append({"id": num, "capture": desc, "name": name, "description": info.get("InterfaceDescription", "") or desc,
                      "status": info.get("Status", ""), "link_speed": info.get("LinkSpeed", ""), "mac": info.get("MacAddress", ""), "guid": info.get("InterfaceGuid", "")})
-    rows.sort(key=lambda r: (r["status"].lower() != "up", r["name"].lower()))
-    return rows
+    rows.sort(key=lambda r: (r["status"].lower() != "up", r["name"].lower())); return rows
 
 
 def _run_diag(cmd: list[str], timeout: int = 12) -> tuple[int, str, str]:
@@ -122,7 +118,6 @@ def interfaces_cmd():
     for c in ("ID","Adapter","Hardware","Status","Link speed","MAC"): t.add_column(c,overflow="fold")
     for r in rows: t.add_row(r["id"],r["name"],r["description"],r["status"] or "—",r["link_speed"] or "—",r["mac"] or "—")
     console.print(t)
-    if not rows: console.print(Panel("TShark did not expose a usable Ethernet or Wi-Fi interface. Jacknet deliberately ignores loopback, Wi-Fi Direct, USBPcap, virtual adapters, and extcap sources.",title="JACKNET / CAPTURE",style="yellow"))
 
 
 @capture_app.command("diagnose")
@@ -136,60 +131,48 @@ def diagnose_cmd(interface: str=typer.Option(...,"-i","--interface"),duration:in
     console.print(t); ready=[r for r in rows if r[0] in ("Managed capture","Managed no-promisc","Monitor capture") and r[1]=="READY"]
     if ready:
         best=ready[0][0]; suffix=" --monitor" if best=="Monitor capture" else ""; console.print(Panel(f"Capture backend is working via: {best}\nTry: jacknet capture live -i {interface} --duration 30{suffix}",title="JACKNET / CAPTURE DIAGNOSIS")); return
-    console.print(Panel("No working Wi-Fi capture mode was found. Managed capture failure usually indicates Npcap/driver permission or binding trouble; monitor mode additionally depends on adapter/driver support.",title="JACKNET / CAPTURE DIAGNOSIS",style="red")); raise typer.Exit(2)
+    raise typer.Exit(2)
 
 
 @capture_app.command("probe")
 def probe_cmd(duration:int=typer.Option(3,"-d","--duration",min=1,max=10)):
     exe=tshark_path()
     if not exe: console.print(Panel("TShark was not found.",title="JACKNET / CAPTURE PROBE",style="red")); raise typer.Exit(2)
-    rows=_capture_candidates()
-    if not rows: console.print(Panel("No Ethernet/Wi-Fi capture interfaces were found.",title="JACKNET / CAPTURE PROBE",style="red")); raise typer.Exit(2)
-    t=Table(title=f"JACKNET / NETWORK CAPTURE PROBE • {duration}s per interface");
+    rows=_capture_candidates(); t=Table(title=f"JACKNET / NETWORK CAPTURE PROBE • {duration}s per interface")
     for c in ("ID","Adapter","Hardware","Status","Packets","Capture"):t.add_column(c,overflow="fold")
     best=None; best_packets=-1
     for r in rows:
-        console.print(f"[dim]Probing {r['name']} • {r['description']} (interface {r['id']})...[/]"); p,d=_packet_probe(exe,r["id"],duration); status="ACTIVE" if p else "NO TRAFFIC"; t.add_row(r["id"],r["name"],r["description"],r["status"] or "—",str(p),status)
+        p,d=_packet_probe(exe,r["id"],duration);status="ACTIVE" if p else "NO TRAFFIC";t.add_row(r["id"],r["name"],r["description"],r["status"] or "—",str(p),status)
         if p>best_packets:best_packets=p;best=r
-        if d and not p:console.print(f"[dim]  {d}[/]")
     console.print(t)
-    if best and best_packets>0: console.print(Panel(f"Active adapter: [bold cyan]{best['name']}[/] • {best['description']} • interface [bold cyan]{best['id']}[/] • {best_packets:,} packets observed\nTry: jacknet capture live -i {best['id']} --duration 30",title="JACKNET / RECOMMENDATION")); return
-    target=next((r for r in rows if r["status"].lower()=="up"),rows[0]); console.print(Panel(f"No packets received. Diagnose the active adapter first:\njacknet capture diagnose -i {target['id']}",title="JACKNET / CAPTURE BACKEND FAILURE",style="red")); raise typer.Exit(2)
+    if best and best_packets>0: console.print(Panel(f"Active adapter: {best['name']} • {best['description']} • interface {best['id']} • {best_packets:,} packets observed",title="JACKNET / RECOMMENDATION")); return
+    raise typer.Exit(2)
 
 
 @capture_app.command("analyze")
 def analyze_cmd(path:Path=typer.Argument(...,exists=True,readable=True),json_out:bool=typer.Option(False,"--json")):
     ok,note=capture_ready()
     if not ok:console.print(f"[red]{note}[/]");raise typer.Exit(2)
-    try:stats=ingest_capture(path);learned=run_learning()
-    except Exception as exc:console.print(Panel(str(exc),title="JACKNET / CAPTURE ERROR",style="red"));raise typer.Exit(2)
-    stats["learning"]=learned
+    stats=ingest_capture(path);learned=run_learning();stats["learning"]=learned
     if json_out:typer.echo(json.dumps(stats,indent=2));return
-    body=f"Capture: {stats['capture']}\nPackets: {stats['packets']:,}\nFull decodes stored: {stats.get('decoded_packets',0):,}\nArtifacts extracted: {stats.get('artifacts',0):,}\nGraph relationships: {stats.get('relationships',0):,}\nDevices linked: {stats['devices']}\nLocal IPs: {stats['local_ips']}\nExternal endpoints: {stats['external_endpoints']}\nDNS names: {stats['dns_names']}\nLearning examples: {learned['examples']} • fingerprints promoted: {learned['promoted']}"
-    if stats.get("decode_error"):body+=f"\nFull-decode warning: {stats['decode_error']}"
-    console.print(Panel(body,title="JACKNET / CAPTURE ANALYSIS"))
+    console.print(Panel(f"Capture: {stats['capture']}\nPackets: {stats['packets']:,}\nFull decodes stored: {stats.get('decoded_packets',0):,}\nArtifacts extracted: {stats.get('artifacts',0):,}\nGraph relationships: {stats.get('relationships',0):,}\nDevices linked: {stats['devices']}\nDNS names: {stats['dns_names']}\nFingerprints promoted: {learned['promoted']}",title="JACKNET / CAPTURE ANALYSIS"))
 
 
 @capture_app.command("live")
 def live_cmd(interface:str=typer.Option(...,"-i","--interface"),duration:int=typer.Option(60,"-d","--duration",min=1),monitor:bool=typer.Option(False,"--monitor"),output:Path|None=typer.Option(None,"-o","--output")):
     valid={r["id"] for r in _capture_candidates()}
-    if interface not in valid:console.print(Panel(f"Interface {interface} is not an Ethernet/Wi-Fi capture adapter. Allowed: {', '.join(sorted(valid)) or 'none'}",title="JACKNET / CAPTURE ERROR",style="red"));raise typer.Exit(2)
+    if interface not in valid:raise typer.BadParameter(f"Allowed interfaces: {', '.join(sorted(valid)) or 'none'}")
     out=output or paths()["cache"]/f"capture-{datetime.now().strftime('%Y%m%d-%H%M%S')}.pcapng"
-    try:
-        console.print(f"[bold]JACKNET / CAPTURE[/] interface [cyan]{interface}[/] • {duration}s");live_capture(interface,out,duration,monitor);stats=ingest_capture(out,source="live",interface=interface)
-        if stats["packets"]==0:raise RuntimeError(f"Capture completed but interface {interface} produced 0 packets. Run 'jacknet capture diagnose -i {interface}'.")
-        learned=run_learning()
-    except Exception as exc:console.print(Panel(str(exc),title="JACKNET / CAPTURE ERROR",style="red"));raise typer.Exit(2)
-    body=f"Packets: {stats['packets']:,}\nFull decodes stored: {stats.get('decoded_packets',0):,}\nArtifacts extracted: {stats.get('artifacts',0):,}\nGraph relationships: {stats.get('relationships',0):,}\nDevices linked: {stats['devices']}\nCapture: {out}\nFingerprints promoted: {learned['promoted']}"
-    if stats.get("decode_error"):body+=f"\nFull-decode warning: {stats['decode_error']}"
-    console.print(Panel(body,title="JACKNET / CAPTURE COMPLETE"))
+    console.print(f"[bold]JACKNET / CAPTURE[/] interface [cyan]{interface}[/] • {duration}s");live_capture(interface,out,duration,monitor);stats=ingest_capture(out,source="live",interface=interface)
+    if stats["packets"]==0:raise RuntimeError(f"Capture completed but interface {interface} produced 0 packets")
+    learned=run_learning();console.print(Panel(f"Packets: {stats['packets']:,}\nFull decodes stored: {stats.get('decoded_packets',0):,}\nArtifacts extracted: {stats.get('artifacts',0):,}\nGraph relationships: {stats.get('relationships',0):,}\nDevices linked: {stats['devices']}\nCapture: {out}\nFingerprints promoted: {learned['promoted']}",title="JACKNET / CAPTURE COMPLETE"))
 
 
 def dossier_cmd(ip:str=typer.Argument(...),json_out:bool=typer.Option(False,"--json")):
     d=dossier_for_ip(ip)
     if not d:console.print(f"[yellow]No dossier found for {ip}.[/]");raise typer.Exit(1)
     if json_out:typer.echo(json.dumps(d,indent=2));return
-    console.print(Panel(f"Device ID: {d['device_id']}\nMAC: {d['canonical_mac'] or '—'}\nLabel: {d['user_label'] or d['model'] or 'Unknown'}\nManufacturer: {d['manufacturer'] or '—'}\nType: {d['device_type'] or 'unknown'}\nConfidence: {d['confidence'] or 0}%\nFirst seen: {d['first_seen']}\nLast seen: {d['last_seen']}",title=f"JACKNET / DOSSIER • {ip}"))
+    console.print(Panel(f"Device ID: {d['device_id']}\nMAC: {d['canonical_mac'] or '—'} ({d.get('mac_type','unknown')})\nLabel: {d['user_label'] or d['model'] or 'Unknown'}\nManufacturer: {d['manufacturer'] or '—'}\nType: {d['device_type'] or 'unknown'}\nConfidence: {d['confidence'] or 0}%\nFirst seen: {d['first_seen']}\nLast seen: {d['last_seen']}",title=f"JACKNET / DOSSIER • {ip}"))
 
 
 def database_report_cmd(output:Path|None=typer.Option(None,"-o","--output"),json_out:bool=typer.Option(False,"--json")):
@@ -197,7 +180,7 @@ def database_report_cmd(output:Path|None=typer.Option(None,"-o","--output"),json
     if json_out:typer.echo(json.dumps(rows,indent=2))
     else:
         t=Table(title="JACKNET / LEARNED NETWORK DATABASE")
-        for c in ("ID","IPs","MAC","Identity","Type","Confidence","Traffic","Last seen"):t.add_column(c,overflow="fold")
-        for r in rows:t.add_row(str(r['device_id']),r['ips'] or '—',r['mac'] or '—',r['label'] or r['model'] or 'Unknown',r['device_type'] or 'unknown',f"{r['confidence'] or 0}%",str(r['traffic_packets']),r['last_seen'])
+        for c in ("ID","Current IP","MAC","MAC type","Identity","Type","Confidence","Traffic","Addr hist","Last seen"):t.add_column(c,overflow="fold")
+        for r in rows:t.add_row(str(r['device_id']),r['current_ip'] or '—',r['mac'] or '—',r['mac_type'],r['label'] or r['model'] or 'Unknown',r['device_type'] or 'unknown',f"{r['confidence'] or 0}%",str(r['traffic_packets']),str(r['address_count']),r['last_seen'])
         console.print(t)
     if output:output.write_text(json.dumps(rows,indent=2),encoding="utf-8");console.print(f"[green]Wrote database report:[/] {output.resolve()}")
