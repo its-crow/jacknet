@@ -33,7 +33,6 @@ def _friendly_capture_name(description: str) -> str:
 
 
 def _is_real_lan_interface(description: str) -> bool:
-    """Accept only user-facing Ethernet or Wi-Fi interfaces, never loopback/extcap/virtual sources."""
     friendly = _friendly_capture_name(description)
     text = f"{description} {friendly}".lower()
     if any(token in text for token in _BLOCKED_CAPTURE_NAMES):
@@ -64,6 +63,98 @@ def _capture_candidates() -> list[dict[str, str]]:
     return rows
 
 
+def _run_diag(cmd: list[str], timeout: int = 12) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 999, "", str(exc)
+
+
+def _packet_probe(exe: str, interface: str, duration: int, monitor: bool = False, no_promisc: bool = False) -> tuple[int, str]:
+    cmd = [exe, "-n"]
+    if monitor:
+        cmd.append("-I")
+    cmd += ["-i", interface]
+    if no_promisc:
+        cmd.append("-p")
+    cmd += ["-a", f"duration:{duration}", "-T", "fields", "-e", "frame.number"]
+    rc, out, err = _run_diag(cmd, timeout=duration + 8)
+    packets = sum(1 for line in out.splitlines() if line.strip())
+    detail = err or (f"exit {rc}" if rc else "")
+    return packets, detail
+
+
+def _linktypes(exe: str, interface: str, monitor: bool = False) -> tuple[bool, str]:
+    cmd = [exe, "-i", interface]
+    if monitor:
+        cmd.append("-I")
+    cmd.append("-L")
+    rc, out, err = _run_diag(cmd)
+    text = out or err
+    return rc == 0, text
+
+
+def _windows_npcap_service() -> tuple[str, str]:
+    rc, out, err = _run_diag(["sc.exe", "query", "npcap"])
+    text = out or err
+    if "RUNNING" in text.upper():
+        return "READY", "Npcap service is running"
+    if rc == 0:
+        return "WARN", "Npcap service exists but is not running"
+    return "WARN", "Npcap service state could not be confirmed"
+
+
+def _windows_wireless_capabilities() -> tuple[str, str]:
+    rc, out, err = _run_diag(["netsh", "wlan", "show", "wirelesscapabilities"], timeout=15)
+    text = out or err
+    if rc != 0 or not text:
+        return "WARN", "Windows wireless monitor-mode capability could not be queried"
+    match = re.search(r"Network monitor mode\s*:\s*(.+)", text, flags=re.IGNORECASE)
+    if match:
+        value = match.group(1).strip()
+        return ("READY" if "yes" in value.lower() or "supported" in value.lower() else "INFO", f"Network monitor mode: {value}")
+    return "INFO", "Windows returned wireless capabilities, but monitor-mode support was not clearly reported"
+
+
+def _capture_backend_diagnostics(interface: str, duration: int = 3) -> list[tuple[str, str, str]]:
+    exe = tshark_path()
+    if not exe:
+        return [("TShark", "FAIL", "TShark not found")]
+
+    rows: list[tuple[str, str, str]] = []
+    svc_status, svc_note = _windows_npcap_service()
+    rows.append(("Npcap service", svc_status, svc_note))
+
+    ok, normal_links = _linktypes(exe, interface, monitor=False)
+    rows.append(("Managed link types", "READY" if ok else "WARN", normal_links or "No link-layer types reported"))
+
+    packets, detail = _packet_probe(exe, interface, duration, monitor=False, no_promisc=False)
+    rows.append(("Managed capture", "READY" if packets else "FAIL", f"{packets} packets" + (f" • {detail}" if detail else "")))
+
+    np_packets, np_detail = _packet_probe(exe, interface, duration, monitor=False, no_promisc=True)
+    rows.append(("Managed no-promisc", "READY" if np_packets else "FAIL", f"{np_packets} packets" + (f" • {np_detail}" if np_detail else "")))
+
+    mon_ok, mon_links = _linktypes(exe, interface, monitor=True)
+    rows.append(("Monitor link types", "READY" if mon_ok else "INFO", mon_links or "Monitor mode not exposed by this adapter/driver"))
+
+    if mon_ok:
+        mon_packets, mon_detail = _packet_probe(exe, interface, duration, monitor=True, no_promisc=False)
+        rows.append(("Monitor capture", "READY" if mon_packets else "FAIL", f"{mon_packets} packets" + (f" • {mon_detail}" if mon_detail else "")))
+
+    cap_status, cap_note = _windows_wireless_capabilities()
+    rows.append(("Windows WLAN", cap_status, cap_note))
+    return rows
+
+
 @capture_app.command("interfaces")
 def interfaces_cmd():
     """Show Ethernet/Wi-Fi capture interfaces only."""
@@ -85,6 +176,40 @@ def interfaces_cmd():
             title="JACKNET / CAPTURE",
             style="yellow",
         ))
+
+
+@capture_app.command("diagnose")
+def diagnose_cmd(interface: str = typer.Option(..., "-i", "--interface"), duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)):
+    """Diagnose Npcap/Wi-Fi capture capability for one real network interface."""
+    valid_ids = {row["id"] for row in _capture_candidates()}
+    if interface not in valid_ids:
+        allowed = ", ".join(sorted(valid_ids)) or "none"
+        console.print(Panel(f"Interface {interface} is not a usable Ethernet/Wi-Fi interface. Allowed: {allowed}", title="JACKNET / CAPTURE DIAGNOSE", style="red"))
+        raise typer.Exit(2)
+
+    rows = _capture_backend_diagnostics(interface, duration)
+    table = Table(title=f"JACKNET / CAPTURE DIAGNOSTICS • interface {interface}")
+    table.add_column("Check")
+    table.add_column("Status")
+    table.add_column("Details", overflow="fold")
+    for name, status, details in rows:
+        table.add_row(name, status, details)
+    console.print(table)
+
+    ready_checks = [r for r in rows if r[0] in ("Managed capture", "Managed no-promisc", "Monitor capture") and r[1] == "READY"]
+    if ready_checks:
+        best = ready_checks[0][0]
+        suffix = " --monitor" if best == "Monitor capture" else ""
+        console.print(Panel(f"Capture backend is working via: {best}\nTry: jacknet capture live -i {interface} --duration 30{suffix}", title="JACKNET / CAPTURE DIAGNOSIS"))
+        return
+
+    console.print(Panel(
+        "No working Wi-Fi capture mode was found. If 'Managed no-promisc' fails too, the likely causes are Npcap/driver permission or driver binding issues. "
+        "If managed capture fails but monitor link types are exposed, reinstall/repair Npcap with raw 802.11 support enabled and retry as Administrator.",
+        title="JACKNET / CAPTURE DIAGNOSIS",
+        style="red",
+    ))
+    raise typer.Exit(2)
 
 
 @capture_app.command("probe")
@@ -114,35 +239,14 @@ def probe_cmd(duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)
     for row in rows:
         num = row["id"]
         console.print(f"[dim]Probing {row['name']} (interface {num})...[/]")
-        stderr = ""
-        try:
-            proc = subprocess.run(
-                [exe, "-n", "-i", num, "-a", f"duration:{duration}", "-T", "fields", "-e", "frame.number"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=duration + 8,
-            )
-            packets = sum(1 for line in proc.stdout.splitlines() if line.strip())
-            stderr = proc.stderr.strip()
-            if proc.returncode and packets == 0:
-                status = "ERROR"
-            elif packets:
-                status = "ACTIVE"
-            else:
-                status = "NO TRAFFIC"
-            if packets > best_packets:
-                best_packets = packets
-                best = row
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            packets = 0
-            status = "ERROR"
-            stderr = str(exc)
+        packets, detail = _packet_probe(exe, num, duration)
+        status = "ACTIVE" if packets else "NO TRAFFIC"
+        if packets > best_packets:
+            best_packets = packets
+            best = row
         table.add_row(num, row["name"], str(packets), status)
-        if status == "ERROR" and stderr:
-            console.print(f"[red]  {stderr}[/]")
+        if detail and not packets:
+            console.print(f"[dim]  {detail}[/]")
 
     console.print(table)
     if best is not None and best_packets > 0:
@@ -153,10 +257,11 @@ def probe_cmd(duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)
             title="JACKNET / RECOMMENDATION",
         ))
     else:
+        target = rows[0]["id"]
         console.print(Panel(
-            "Jacknet found the real Ethernet/Wi-Fi adapter, but TShark received zero packets from it.\n\n"
-            "This is a Windows/Npcap capture-backend problem, not an interface-selection problem. "
-            "Jacknet will not substitute loopback traffic and call it success.",
+            f"Jacknet found the real Ethernet/Wi-Fi adapter, but standard TShark capture received zero packets.\n\n"
+            f"Run: jacknet capture diagnose -i {target}\n\n"
+            "That will test Npcap service state, normal capture, capture with promiscuous mode disabled, link-layer support, and monitor mode.",
             title="JACKNET / CAPTURE BACKEND FAILURE",
             style="red",
         ))
@@ -165,7 +270,6 @@ def probe_cmd(duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)
 
 @capture_app.command("analyze")
 def analyze_cmd(path: Path = typer.Argument(..., exists=True, readable=True), json_out: bool = typer.Option(False,"--json")):
-    """Analyze a .pcap/.pcapng file, attach traffic to devices, and learn from it."""
     ok,note=capture_ready()
     if not ok: console.print(f"[red]{note}[/]"); raise typer.Exit(2)
     try: stats=ingest_capture(path); learned=run_learning()
@@ -187,7 +291,6 @@ def analyze_cmd(path: Path = typer.Argument(..., exists=True, readable=True), js
 
 @capture_app.command("live")
 def live_cmd(interface: str = typer.Option(...,"-i","--interface"), duration: int = typer.Option(60,"-d","--duration",min=1), monitor: bool = typer.Option(False,"--monitor",help="Request monitor mode from the capture backend"), output: Path | None = typer.Option(None,"-o","--output")):
-    """Capture traffic, then immediately ingest all decodable evidence into Jacknet."""
     valid_ids = {row["id"] for row in _capture_candidates()}
     if interface not in valid_ids:
         allowed = ", ".join(sorted(valid_ids)) or "none"
@@ -206,7 +309,7 @@ def live_cmd(interface: str = typer.Option(...,"-i","--interface"), duration: in
         if stats["packets"] == 0:
             raise RuntimeError(
                 f"Capture completed but network interface {interface} produced 0 packets. "
-                "Jacknet will not mark this as success. Run 'jacknet capture probe' for backend diagnostics."
+                f"Run 'jacknet capture diagnose -i {interface}' for Npcap/Wi-Fi diagnostics."
             )
         learned=run_learning()
     except Exception as exc: console.print(Panel(str(exc),title="JACKNET / CAPTURE ERROR",style="red")); raise typer.Exit(2)
@@ -219,7 +322,6 @@ def live_cmd(interface: str = typer.Option(...,"-i","--interface"), duration: in
 
 
 def dossier_cmd(ip: str = typer.Argument(...), json_out: bool = typer.Option(False,"--json")):
-    """Show everything JackNet has learned about the device associated with an IP."""
     d=dossier_for_ip(ip)
     if not d: console.print(f"[yellow]No dossier found for {ip}.[/]"); raise typer.Exit(1)
     if json_out: typer.echo(json.dumps(d,indent=2)); return
@@ -239,7 +341,6 @@ def dossier_cmd(ip: str = typer.Argument(...), json_out: bool = typer.Option(Fal
 
 
 def database_report_cmd(output: Path | None = typer.Option(None,"-o","--output"), json_out: bool = typer.Option(False,"--json")):
-    """Generate an up-to-date inventory from accumulated database knowledge."""
     rows=all_devices()
     if json_out:
         text=json.dumps(rows,indent=2); typer.echo(text)
