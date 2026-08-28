@@ -178,6 +178,57 @@ MIGRATIONS: list[tuple[int, str]] = [
     CREATE INDEX IF NOT EXISTS idx_device_features_device ON device_features(device_id);
     CREATE INDEX IF NOT EXISTS idx_device_features_lookup ON device_features(feature_type, feature_value);
     """),
+    (4, """
+    CREATE TABLE IF NOT EXISTS packet_decodes (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        packet_number INTEGER NOT NULL,
+        observed_at TEXT,
+        protocol_stack TEXT,
+        raw_json TEXT NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES capture_sessions(id),
+        UNIQUE(session_id, packet_number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_packet_decodes_session ON packet_decodes(session_id);
+    CREATE INDEX IF NOT EXISTS idx_packet_decodes_time ON packet_decodes(observed_at);
+
+    CREATE TABLE IF NOT EXISTS network_artifacts (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER,
+        device_id INTEGER,
+        observed_at TEXT NOT NULL,
+        artifact_type TEXT NOT NULL,
+        artifact_value TEXT NOT NULL,
+        source TEXT NOT NULL,
+        protocol TEXT,
+        metadata TEXT,
+        FOREIGN KEY(session_id) REFERENCES capture_sessions(id),
+        FOREIGN KEY(device_id) REFERENCES devices(device_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_network_artifacts_device ON network_artifacts(device_id);
+    CREATE INDEX IF NOT EXISTS idx_network_artifacts_lookup ON network_artifacts(artifact_type, artifact_value);
+    CREATE INDEX IF NOT EXISTS idx_network_artifacts_time ON network_artifacts(observed_at);
+
+    CREATE TABLE IF NOT EXISTS network_relationships (
+        id INTEGER PRIMARY KEY,
+        device_id INTEGER,
+        relation TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_value TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_value TEXT NOT NULL,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        hits INTEGER NOT NULL DEFAULT 1,
+        protocol TEXT,
+        metadata TEXT,
+        FOREIGN KEY(device_id) REFERENCES devices(device_id),
+        UNIQUE(device_id, relation, source_type, source_value, target_type, target_value)
+    );
+    CREATE INDEX IF NOT EXISTS idx_relationships_device ON network_relationships(device_id);
+    CREATE INDEX IF NOT EXISTS idx_relationships_target ON network_relationships(target_type, target_value);
+    CREATE INDEX IF NOT EXISTS idx_relationships_relation ON network_relationships(relation);
+    """),
 ]
 
 
