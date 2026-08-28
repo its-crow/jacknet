@@ -2,7 +2,7 @@
 
 JackNet is a pipx-installable LAN inventory, passive traffic analysis, device-fingerprinting, and local learning CLI. It correlates active discovery with persistent network evidence so a device can accumulate a dossier over time rather than being identified from a single scan.
 
-JackNet currently combines ARP/MAC data, OUI vendor information, PTR hostnames, mDNS/DNS-SD, SSDP/UPnP, Nmap service/OS guesses, passive packet metadata, decoded protocol artifacts, historical observations, user confirmations, and learned fingerprints.
+JackNet currently combines ARP/MAC data, OUI vendor information, PTR hostnames, mDNS/DNS-SD, SSDP/UPnP, Nmap service/OS guesses, passive packet metadata, decoded protocol artifacts, historical observations, user confirmations, network context, and learned fingerprints.
 
 ## Install
 
@@ -20,6 +20,30 @@ During development from a local checkout:
 git pull
 pipx install . --force
 ```
+
+## Network identity and IP scope
+
+An IP address is **not** a JackNet device identity and is never treated as globally unique. `192.168.1.19` on one LAN can be an entirely different machine from `192.168.1.19` on another LAN.
+
+JackNet keeps a durable integer `device_id` for each known device and separately records network-scoped address observations:
+
+```text
+device_id 12  PlayStation 5
+    |
+    +-- network 3 / INTERNETS / 192.168.1.0/24 -> 192.168.1.103
+    +-- network 7 / another LAN / 192.168.1.0/24 -> 192.168.1.19
+```
+
+Network identity is derived from stable local-network context such as gateway identity, subnet, and SSID when available. It does not depend on the JackNet sensor's own NIC, which allows a future Raspberry Pi sensor and the Windows workstation to contribute to the same logical network record.
+
+Inspect the current and previously observed networks:
+
+```powershell
+jacknet network
+jacknet network --json
+```
+
+The network table records a generated network key, CIDR, gateway IP/MAC, SSID, interface metadata, and first/last seen timestamps.
 
 ## First-time initialization
 
@@ -47,8 +71,6 @@ jacknet doctor
 jacknet doctor --fix
 ```
 
-`--fix` only repairs JackNet-owned state such as application directories and database migrations. It does not silently modify external software.
-
 ## Scanning
 
 ```powershell
@@ -60,25 +82,18 @@ jacknet scan -A --man SONY --confidence 70
 jacknet scan -A --type game_console
 ```
 
-Active scans feed the same persistent device database used by passive capture.
+Every stored scan observation receives the current `network_id`. MAC/device identity and network/IP identity are stored separately.
 
 ## Passive capture
 
-List only real Ethernet/Wi-Fi adapters exposed by TShark:
-
 ```powershell
 jacknet capture interfaces
-```
-
-On Windows JackNet correlates TShark interfaces with `Get-NetAdapter`, so the table includes the real adapter description, state, link speed, and MAC address. Active adapters are shown first.
-
-```powershell
 jacknet capture probe
 jacknet capture diagnose -i 1
 jacknet capture live -i 1 --duration 30
 ```
 
-A successful live capture reports packet count, full packet decodes stored, normalized artifacts extracted, graph relationships created/updated, devices linked, capture-file path, and fingerprints promoted by the learner.
+On Windows JackNet correlates TShark interfaces with `Get-NetAdapter`, so the interface table includes the real adapter description, state, link speed, and MAC address. Each capture session also stores the logical network on which it occurred. Capture-derived traffic observations, artifacts, relationships, endpoints, and addresses carry that network scope.
 
 Analyze an existing capture:
 
@@ -99,8 +114,6 @@ Encrypted HTTPS application payloads remain encrypted unless separate decryption
 
 ## Inspect captured knowledge
 
-After JackNet has linked traffic to a known device, inspect the accumulated passive evidence directly:
-
 ```powershell
 jacknet evidence 192.168.1.55
 jacknet sites 192.168.1.55
@@ -108,30 +121,27 @@ jacknet graph 192.168.1.55
 jacknet dossier 192.168.1.55
 ```
 
-`evidence` groups normalized packet artifacts and shows hit counts plus the number of independent capture sessions in which each artifact appeared. `sites` combines DNS, TLS SNI, and plaintext HTTP host evidence. `graph` shows persistent device relationships such as `contacts`, `uses`, and `connects_to`.
+IP-based lookups first resolve inside the **currently connected network**. This prevents an address reused on another LAN from silently selecting the wrong device. Dossiers retain address history across multiple networks.
 
-All three inspection commands support `--json` for machine-readable output.
+## Reconcile trusted router/admin data
+
+Use `reconcile` when a router, DHCP server, or other trusted source gives you an authoritative current IP/MAC mapping:
+
+```powershell
+jacknet reconcile 192.168.1.103 --mac 2e:e1:5d:1d:68:26 --identity "PlayStation 5" --manufacturer Sony --type game_console
+```
+
+By default the mapping applies only to the currently detected network. A stored network can be selected explicitly:
+
+```powershell
+jacknet reconcile 192.168.1.103 --mac 2e:e1:5d:1d:68:26 --network-id 3
+```
+
+Reconciliation removes conflicting ownership of that IP only **within that network**. The same numerical IP on another stored network is untouched.
 
 ## Persistent evidence and learning
 
-JackNet is designed around accumulated evidence rather than one-shot guesses:
-
-```text
-active scans ───────────┐
-                       │
-packet captures ────────┼──> persistent device dossiers
-                       │          │
-user confirmations ────┘          ├── features
-                                  ├── endpoints
-                                  ├── protocol behavior
-                                  ├── relationships
-                                  └── identity hypotheses
-                                           │
-                                           v
-                                      fingerprint learner
-```
-
-Passive packet features are promoted conservatively. Repetition within a single capture does not automatically become persistent fingerprint evidence; JackNet now considers support across separate capture sessions. Current scans can also use stable passive features already present in the device's dossier, so packet-derived knowledge survives into later identification runs.
+JackNet is designed around accumulated evidence rather than one-shot guesses. Passive packet features are promoted conservatively: repetition within one capture does not automatically become persistent fingerprint evidence; JackNet considers support across separate capture sessions. Device learning can span networks because a durable device is distinct from the address it happened to receive on a particular LAN.
 
 See [docs/LEARNING.md](docs/LEARNING.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -146,25 +156,17 @@ jacknet learn
 jacknet fingerprints
 ```
 
+Confirmation/correction IP resolution is network-scoped as well.
+
 ## Reports and dossiers
 
 ```powershell
 jacknet scan -A --report -o network.jnet
-jacknet scan -A --report --format json -o network.json
-jacknet scan -A --report --format html -o network.html
 jacknet dossier 192.168.1.55
 jacknet db-report
 ```
 
-Supported scan-report formats include `jnet`, `json`, `txt`, `csv`, and `html`.
-
-## Knowledge and history
-
-```powershell
-jacknet manual
-jacknet manual --search playstation
-jacknet history --limit 100
-```
+`db-report` shows the current network, current address on that network, total scoped address history, and number of networks on which each device has been observed.
 
 ## Health, repair, and backup
 
@@ -174,34 +176,37 @@ jacknet doctor --fix
 jacknet repair
 jacknet repair --yes
 jacknet backup
-jacknet backup -o D:\Backups\jacknet.db
+jacknet evidence-rebuild
 ```
 
-Safe repair behavior includes recreating missing JackNet-owned directories, applying idempotent schema migrations, preserving corrupt databases rather than silently destroying them, and reporting external dependency problems instead of modifying unrelated software behind the user's back.
+`evidence-rebuild` preserves stored network identities and, for network-aware capture sessions, replays each capture into its original network scope.
 
 ## Data model
 
-The persistent schema contains devices, addresses, observations, labels, extracted features, capture sessions, traffic observations, endpoints, full packet decodes, normalized network artifacts, graph relationships, fingerprints, fingerprint features, hypotheses, and corrections.
+The persistent schema contains `networks`, durable `devices`, network-scoped `device_network_addresses`, observations, labels, extracted features, capture sessions, traffic observations, endpoints, full packet decodes, normalized network artifacts, graph relationships, fingerprints, fingerprint features, hypotheses, and corrections.
 
-Raw observations are intentionally retained so newer fingerprint engines can re-evaluate older evidence.
+The central identity rule is:
+
+```text
+IP != device identity
+(network_id, IP) = address context
+device_id = durable JackNet identity
+MAC + evidence + confirmations = identity evidence
+```
 
 ## Network-wide sensors
 
 A capture performed on an ordinary workstation NIC usually sees that workstation's traffic plus broadcast/multicast traffic; a switched LAN does not normally copy every device's unicast traffic to every port.
 
-JackNet is being structured so additional sensors can later feed the same evidence database. Useful future capture points include a Raspberry Pi connected to a mirrored/SPAN port, a Pi acting as an inline bridge/gateway, router capture, a dedicated Wi-Fi monitoring adapter, and remote Wireshark extcap sources such as SSHdump/Wifidump.
+JackNet is being structured so additional authorized sensors can feed the same evidence database. Useful future capture points include a Raspberry Pi connected to a mirrored/SPAN port, a Pi acting as an inline bridge/gateway, router capture, a dedicated Wi-Fi monitoring adapter, and remote Wireshark extcap sources such as SSHdump/Wifidump.
 
-The long-term model is one JackNet knowledge base receiving evidence from multiple authorized sensors.
+Because sensor identity is separate from logical network identity, multiple sensors can eventually observe the same network without creating duplicate LAN records.
 
 ## Pipelines / stdin
 
 ```powershell
 "192.168.1.55" | jacknet scan
-"192.168.1.55", "192.168.1.72" | jacknet scan --deep
 Get-Content .\targets.txt | jacknet scan --verbose
-"192.168.1.0/28" | jacknet scan --no-nmap
 jacknet scan -A --man SONY -c 70 --raw
 jacknet scan -A --json | ConvertFrom-Json
 ```
-
-`--raw` writes only matching IP addresses to stdout. `--json` emits plain JSON to stdout.
