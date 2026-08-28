@@ -14,7 +14,7 @@ from typing import Iterable
 
 from .db import connect, migrate
 from .evidence import ingest_full_decode
-from .network_context import ensure_network
+from .network_context import ensure_network, get_network
 
 TSHARK_FIELDS=["frame.time_epoch","frame.len","eth.src","eth.dst","ip.src","ip.dst","ipv6.src","ipv6.dst","tcp.srcport","tcp.dstport","udp.srcport","udp.dstport","_ws.col.Protocol","dns.qry.name","dns.resp.name","tls.handshake.extensions_server_name","http.host","dhcp.option.hostname","bootp.option.hostname","ssdp.server","ssdp.usn","wlan.sa","wlan.da","radiotap.dbm_antsignal"]
 
@@ -127,8 +127,15 @@ def _packet_owner(rec,src_did,dst_did):
     if _is_local_ip(rec.dst_ip):return dst_did
     return src_did or dst_did
 
-def ingest_capture(path:Path,source="pcap",interface=None):
-    migrate();network_id,network=ensure_network();path=path.expanduser().resolve();started=_now();packet_count=0;devices=set();local_ips=set();external_endpoints=set();protocol_counts=defaultdict(int);dns_names=set()
+def ingest_capture(path:Path,source="pcap",interface=None,network_id_override:int|None=None):
+    migrate()
+    if network_id_override is not None:
+        network=get_network(network_id_override)
+        if network is None: network_id,network=ensure_network()
+        else: network_id=network_id_override
+    else:
+        network_id,network=ensure_network()
+    path=path.expanduser().resolve();started=_now();packet_count=0;devices=set();local_ips=set();external_endpoints=set();protocol_counts=defaultdict(int);dns_names=set()
     with connect() as con:
         cur=con.execute("INSERT INTO capture_sessions(started_at,source,capture_file,interface,packet_count,network_id) VALUES(?,?,?,?,0,?)",(started,source,str(path),interface,network_id));session_id=int(cur.lastrowid)
         for rec in iter_capture(path):
