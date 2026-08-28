@@ -40,19 +40,7 @@ jacknet config --data-dir D:\NetworkTools\JackNet
 
 ## Doctor
 
-`jacknet doctor` reports JackNet-owned state and external capabilities. On Windows this includes:
-
-- Nmap
-- Wireshark
-- TShark
-- dumpcap
-- Npcap service state
-- Scapy
-- Zeroconf
-- MAC/OUI support
-- application data location
-- database integrity
-- platform information
+`jacknet doctor` reports JackNet-owned state and external capabilities. On Windows this includes Nmap, Wireshark, TShark, dumpcap, Npcap service state, Scapy, Zeroconf, MAC/OUI support, application-data location, database integrity, and platform information.
 
 ```powershell
 jacknet doctor
@@ -84,37 +72,15 @@ jacknet capture interfaces
 
 On Windows JackNet correlates TShark interfaces with `Get-NetAdapter`, so the table includes the real adapter description, state, link speed, and MAC address. Active adapters are shown first.
 
-Probe capture interfaces:
-
 ```powershell
 jacknet capture probe
-```
-
-Diagnose one interface in detail:
-
-```powershell
 jacknet capture diagnose -i 1
-```
-
-The diagnostic checks Npcap service state, managed capture, managed capture without promiscuous mode, available link-layer types, and monitor-mode support.
-
-Capture and immediately ingest traffic:
-
-```powershell
 jacknet capture live -i 1 --duration 30
 ```
 
-Typical successful output reports:
+A successful live capture reports packet count, full packet decodes stored, normalized artifacts extracted, graph relationships created/updated, devices linked, capture-file path, and fingerprints promoted by the learner.
 
-- packets captured
-- full packet decodes stored
-- normalized artifacts extracted
-- graph relationships created/updated
-- devices linked
-- capture file path
-- fingerprints promoted by the learner
-
-Analyze an existing capture instead:
+Analyze an existing capture:
 
 ```powershell
 jacknet capture analyze sample.pcapng
@@ -127,20 +93,24 @@ See [docs/PASSIVE_CAPTURE.md](docs/PASSIVE_CAPTURE.md) for the capture model and
 
 JackNet keeps the original PCAP/PCAPNG capture and can preserve TShark's structured packet decode in the database. It also normalizes useful evidence into queryable artifacts and graph relationships.
 
-Examples include:
-
-- source/destination MAC and IP information
-- DNS queries and answers
-- mDNS/DNS-SD names and services
-- TLS SNI, versions, ALPN, and certificate-derived metadata when exposed
-- HTTP host, method, URI, user agent, referrer, and content type when plaintext
-- DHCP/BOOTP hostnames
-- NBNS/SMB names
-- SSDP/UPnP server and USN data
-- observed protocols and services
-- external destinations and device-to-destination relationships
+Examples include source/destination MAC and IP information, DNS queries and answers, mDNS/DNS-SD names and services, TLS SNI/version/ALPN/certificate metadata when exposed, plaintext HTTP metadata, DHCP/BOOTP hostnames, NBNS/SMB names, SSDP/UPnP data, protocol use, services, and external destinations.
 
 Encrypted HTTPS application payloads remain encrypted unless separate decryption material is explicitly available. JackNet still learns from the surrounding metadata.
+
+## Inspect captured knowledge
+
+After JackNet has linked traffic to a known device, inspect the accumulated passive evidence directly:
+
+```powershell
+jacknet evidence 192.168.1.55
+jacknet sites 192.168.1.55
+jacknet graph 192.168.1.55
+jacknet dossier 192.168.1.55
+```
+
+`evidence` groups normalized packet artifacts and shows hit counts plus the number of independent capture sessions in which each artifact appeared. `sites` combines DNS, TLS SNI, and plaintext HTTP host evidence. `graph` shows persistent device relationships such as `contacts`, `uses`, and `connects_to`.
+
+All three inspection commands support `--json` for machine-readable output.
 
 ## Persistent evidence and learning
 
@@ -161,34 +131,17 @@ user confirmations ────┘          ├── features
                                       fingerprint learner
 ```
 
-A confirmed or repeatedly supported identity can teach reusable fingerprints. The goal is for JackNet to become more useful as it observes the same network over time while preserving the evidence behind each conclusion.
+Passive packet features are promoted conservatively. Repetition within a single capture does not automatically become persistent fingerprint evidence; JackNet now considers support across separate capture sessions. Current scans can also use stable passive features already present in the device's dossier, so packet-derived knowledge survives into later identification runs.
 
 See [docs/LEARNING.md](docs/LEARNING.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Device confirmation and correction
 
-Confirm JackNet's current identification:
-
 ```powershell
 jacknet confirm 192.168.1.55 --yes
-```
-
-Supply your own identity or custom name:
-
-```powershell
 jacknet confirm 192.168.1.55 --identity "HP LaserJet M404" --type printer --yes
 jacknet confirm 192.168.1.55 --custom-id "Office Printer" --type printer --yes
-```
-
-Correct an existing identification:
-
-```powershell
 jacknet correct 192.168.1.55 --identity "Brother HL-L2395DW" --type printer
-```
-
-Inspect learned fingerprints:
-
-```powershell
 jacknet learn
 jacknet fingerprints
 ```
@@ -224,14 +177,7 @@ jacknet backup
 jacknet backup -o D:\Backups\jacknet.db
 ```
 
-Safe repair behavior:
-
-- recreates missing JackNet-owned directories
-- creates a missing database and applies schema migrations
-- reruns idempotent migrations when the database is healthy
-- never silently destroys a corrupt database
-- preserves damaged databases before creating a clean replacement when explicitly authorized
-- reports external dependency problems instead of modifying unrelated software behind the user's back
+Safe repair behavior includes recreating missing JackNet-owned directories, applying idempotent schema migrations, preserving corrupt databases rather than silently destroying them, and reporting external dependency problems instead of modifying unrelated software behind the user's back.
 
 ## Data model
 
@@ -243,30 +189,17 @@ Raw observations are intentionally retained so newer fingerprint engines can re-
 
 A capture performed on an ordinary workstation NIC usually sees that workstation's traffic plus broadcast/multicast traffic; a switched LAN does not normally copy every device's unicast traffic to every port.
 
-JackNet is being structured so additional sensors can later feed the same evidence database. Useful future capture points include:
-
-- a Raspberry Pi connected to a mirrored/SPAN switch port
-- a Pi acting as an inline bridge/gateway
-- a router capable of remote dumpcap/tcpdump capture
-- a dedicated Wi-Fi monitoring adapter
-- remote Wireshark extcap sources such as SSHdump/Wifidump
+JackNet is being structured so additional sensors can later feed the same evidence database. Useful future capture points include a Raspberry Pi connected to a mirrored/SPAN port, a Pi acting as an inline bridge/gateway, router capture, a dedicated Wi-Fi monitoring adapter, and remote Wireshark extcap sources such as SSHdump/Wifidump.
 
 The long-term model is one JackNet knowledge base receiving evidence from multiple authorized sensors.
 
 ## Pipelines / stdin
-
-JackNet accepts IP addresses, hostnames, and CIDRs from stdin. Redirected stdin is detected automatically.
 
 ```powershell
 "192.168.1.55" | jacknet scan
 "192.168.1.55", "192.168.1.72" | jacknet scan --deep
 Get-Content .\targets.txt | jacknet scan --verbose
 "192.168.1.0/28" | jacknet scan --no-nmap
-```
-
-Pipeline-friendly output:
-
-```powershell
 jacknet scan -A --man SONY -c 70 --raw
 jacknet scan -A --json | ConvertFrom-Json
 ```
