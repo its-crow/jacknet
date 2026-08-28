@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -19,39 +20,141 @@ capture_app = typer.Typer(help="Capture and analyze Wi-Fi/LAN traffic with Wires
 console = Console()
 
 
+def _windows_physical_adapters() -> list[dict[str, str]]:
+    """Return Windows physical Ethernet/Wi-Fi adapters that are currently Up."""
+    if os.name != "nt":
+        return []
+    script = (
+        "Get-NetAdapter -Physical | "
+        "Where-Object {$_.Status -eq 'Up'} | "
+        "Select-Object Name,InterfaceDescription,InterfaceGuid,MediaType,LinkSpeed | "
+        "ConvertTo-Json -Compress"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode or not proc.stdout.strip():
+        return []
+    try:
+        raw = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    rows: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        media = str(item.get("MediaType") or "").lower()
+        name = str(item.get("Name") or "")
+        desc = str(item.get("InterfaceDescription") or "")
+        # Windows sometimes reports 802.3/Native 802.11 rather than friendly media names.
+        text = f"{media} {name} {desc}".lower()
+        if not any(token in text for token in ("802.3", "802.11", "ethernet", "wi-fi", "wifi", "wireless")):
+            continue
+        rows.append({
+            "name": name,
+            "description": desc,
+            "guid": str(item.get("InterfaceGuid") or "").strip("{}"),
+            "media": str(item.get("MediaType") or ""),
+            "link_speed": str(item.get("LinkSpeed") or ""),
+        })
+    return rows
+
+
+def _capture_candidates() -> list[dict[str, str]]:
+    """Match active physical Windows NICs to TShark interface IDs."""
+    tshark_rows = list_interfaces()
+    if os.name != "nt":
+        return [
+            {"id": num, "capture": desc, "name": desc, "description": desc, "link_speed": ""}
+            for num, desc in tshark_rows
+            if "loopback" not in desc.lower()
+        ]
+
+    physical = _windows_physical_adapters()
+    candidates: list[dict[str, str]] = []
+    for adapter in physical:
+        guid = adapter["guid"].lower()
+        name = adapter["name"].lower()
+        desc = adapter["description"].lower()
+        for num, capture_desc in tshark_rows:
+            haystack = capture_desc.lower()
+            if (guid and guid in haystack) or (name and f"({name})" in haystack) or (desc and desc in haystack):
+                candidates.append({
+                    "id": num,
+                    "capture": capture_desc,
+                    "name": adapter["name"],
+                    "description": adapter["description"],
+                    "link_speed": adapter["link_speed"],
+                })
+                break
+    return candidates
+
+
 @capture_app.command("interfaces")
 def interfaces_cmd():
-    """Show capture interfaces visible to TShark."""
+    """Show active physical Ethernet/Wi-Fi capture interfaces."""
     ok, note = capture_ready()
     if not ok:
         console.print(Panel(note, title="JACKNET / CAPTURE", style="yellow")); raise typer.Exit(2)
-    rows = list_interfaces()
-    t=Table(title="JACKNET / CAPTURE INTERFACES"); t.add_column("ID"); t.add_column("Interface", overflow="fold")
-    for num,desc in rows: t.add_row(num,desc)
+    rows = _capture_candidates()
+    t = Table(title="JACKNET / PHYSICAL CAPTURE INTERFACES")
+    t.add_column("ID")
+    t.add_column("Adapter")
+    t.add_column("Link")
+    t.add_column("TShark interface", overflow="fold")
+    for row in rows:
+        t.add_row(row["id"], row["name"], row["link_speed"] or "—", row["capture"])
     console.print(t)
+    if not rows:
+        console.print(Panel(
+            "No active physical Ethernet/Wi-Fi adapter could be matched to TShark. "
+            "Run 'Get-NetAdapter -Physical' in PowerShell to verify Windows sees an Up hardware adapter.",
+            title="JACKNET / CAPTURE",
+            style="yellow",
+        ))
 
 
 @capture_app.command("probe")
-def probe_cmd(duration: int = typer.Option(2, "-d", "--duration", min=1, max=10)):
-    """Test Npcap interfaces and show which ones are actually receiving packets."""
+def probe_cmd(duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)):
+    """Probe active physical Ethernet/Wi-Fi adapters and find one receiving packets."""
     exe = tshark_path()
     if not exe:
         console.print(Panel("TShark was not found.", title="JACKNET / CAPTURE PROBE", style="red")); raise typer.Exit(2)
 
-    rows = [(num, desc) for num, desc in list_interfaces() if "NPF_" in desc]
+    rows = _capture_candidates()
     if not rows:
-        console.print(Panel("No local Npcap interfaces were found.", title="JACKNET / CAPTURE PROBE", style="yellow")); raise typer.Exit(2)
+        console.print(Panel(
+            "No active physical Ethernet/Wi-Fi capture interfaces were found. "
+            "Jacknet will not probe loopback, virtual, USBPcap, or extcap interfaces.",
+            title="JACKNET / CAPTURE PROBE",
+            style="yellow",
+        ))
+        raise typer.Exit(2)
 
-    table = Table(title=f"JACKNET / CAPTURE PROBE • {duration}s per interface")
+    table = Table(title=f"JACKNET / PHYSICAL CAPTURE PROBE • {duration}s per interface")
     table.add_column("ID")
+    table.add_column("Adapter")
     table.add_column("Packets", justify="right")
     table.add_column("Status")
-    table.add_column("Interface", overflow="fold")
-    best_id = None
+    table.add_column("Link")
+    best: dict[str, str] | None = None
     best_packets = -1
 
-    for num, desc in rows:
-        console.print(f"[dim]Probing interface {num}...[/]")
+    for row in rows:
+        num = row["id"]
+        console.print(f"[dim]Probing {row['name']} (interface {num})...[/]")
+        stderr = ""
         try:
             proc = subprocess.run(
                 [exe, "-n", "-i", num, "-a", f"duration:{duration}", "-T", "fields", "-e", "frame.number"],
@@ -63,25 +166,45 @@ def probe_cmd(duration: int = typer.Option(2, "-d", "--duration", min=1, max=10)
                 timeout=duration + 8,
             )
             packets = sum(1 for line in proc.stdout.splitlines() if line.strip())
+            stderr = proc.stderr.strip()
             if proc.returncode and packets == 0:
                 status = "ERROR"
             elif packets:
                 status = "ACTIVE"
             else:
-                status = "QUIET"
+                status = "NO TRAFFIC"
             if packets > best_packets:
                 best_packets = packets
-                best_id = num
-        except (OSError, subprocess.TimeoutExpired):
+                best = row
+        except (OSError, subprocess.TimeoutExpired) as exc:
             packets = 0
             status = "ERROR"
-        table.add_row(num, str(packets), status, desc)
+            stderr = str(exc)
+        table.add_row(num, row["name"], str(packets), status, row["link_speed"] or "—")
+        if status == "ERROR" and stderr:
+            console.print(f"[red]  {stderr}[/]")
 
     console.print(table)
-    if best_id is not None and best_packets > 0:
-        console.print(Panel(f"Best capture interface: [bold cyan]{best_id}[/] • {best_packets:,} packets observed\nTry: jacknet capture live -i {best_id} --duration 30", title="JACKNET / RECOMMENDATION"))
+    if best is not None and best_packets > 0:
+        console.print(Panel(
+            f"Active adapter: [bold cyan]{best['name']}[/] • interface [bold cyan]{best['id']}[/] • "
+            f"{best_packets:,} packets observed\n"
+            f"Try: jacknet capture live -i {best['id']} --duration 30",
+            title="JACKNET / RECOMMENDATION",
+        ))
     else:
-        console.print(Panel("No Npcap interface produced packets. Check that Npcap is running and try an elevated PowerShell session.", title="JACKNET / CAPTURE PROBE", style="yellow"))
+        console.print(Panel(
+            "Windows reports the physical adapter as Up, but TShark received zero packets from it.\n\n"
+            "This is now a capture-backend problem rather than interface selection. On Windows, verify:\n"
+            "• PowerShell is running as Administrator\n"
+            "• the Npcap Packet Driver service is running\n"
+            "• Npcap was installed with WinPcap API compatibility disabled unless required\n"
+            "• for raw Wi-Fi/monitor capture, Npcap was installed with 802.11 traffic support\n\n"
+            "Jacknet will not pretend loopback traffic is a valid network capture.",
+            title="JACKNET / CAPTURE BACKEND FAILURE",
+            style="red",
+        ))
+        raise typer.Exit(2)
 
 
 @capture_app.command("analyze")
@@ -106,6 +229,15 @@ def analyze_cmd(path: Path = typer.Argument(..., exists=True, readable=True), js
 @capture_app.command("live")
 def live_cmd(interface: str = typer.Option(...,"-i","--interface"), duration: int = typer.Option(60,"-d","--duration",min=1), monitor: bool = typer.Option(False,"--monitor",help="Request monitor mode from the capture backend"), output: Path | None = typer.Option(None,"-o","--output")):
     """Capture traffic, then immediately ingest it into JackNet's learning database."""
+    valid_ids = {row["id"] for row in _capture_candidates()}
+    if valid_ids and interface not in valid_ids:
+        console.print(Panel(
+            f"Interface {interface} is not an active physical Ethernet/Wi-Fi adapter. "
+            f"Allowed interfaces: {', '.join(sorted(valid_ids))}",
+            title="JACKNET / CAPTURE ERROR",
+            style="red",
+        ))
+        raise typer.Exit(2)
     stamp=datetime.now().strftime("%Y%m%d-%H%M%S")
     out=output or paths()["cache"] / f"capture-{stamp}.pcapng"
     try:
@@ -114,9 +246,8 @@ def live_cmd(interface: str = typer.Option(...,"-i","--interface"), duration: in
         stats=ingest_capture(out,source="live",interface=interface)
         if stats["packets"] == 0:
             raise RuntimeError(
-                f"Capture completed but interface {interface} produced 0 packets. "
-                "This usually means the interface is inactive or not the adapter carrying your traffic. "
-                "Run 'jacknet capture probe' to find the active capture interface."
+                f"Capture completed but physical interface {interface} produced 0 packets. "
+                "Jacknet will not mark this as success. Run 'jacknet capture probe' for backend diagnostics."
             )
         learned=run_learning()
     except Exception as exc: console.print(Panel(str(exc),title="JACKNET / CAPTURE ERROR",style="red")); raise typer.Exit(2)
