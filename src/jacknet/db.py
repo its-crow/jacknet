@@ -276,6 +276,62 @@ MIGRATIONS: list[tuple[int, str]] = [
     CREATE INDEX IF NOT EXISTS idx_relationships_network ON network_relationships(network_id);
     CREATE INDEX IF NOT EXISTS idx_endpoints_network ON device_endpoints(network_id);
     """),
+    (6, """
+    -- v5 added network_id columns, but the old global UNIQUE constraints still
+    -- treated endpoints/relationships as identical across every network.
+    -- Rebuild these derived tables so network_id is part of identity.
+    DROP INDEX IF EXISTS idx_endpoints_network;
+    CREATE TABLE device_endpoints_v6 (
+        id INTEGER PRIMARY KEY,
+        device_id INTEGER NOT NULL,
+        endpoint TEXT NOT NULL,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        hits INTEGER NOT NULL DEFAULT 1,
+        protocol TEXT,
+        network_id INTEGER,
+        FOREIGN KEY(device_id) REFERENCES devices(device_id),
+        FOREIGN KEY(network_id) REFERENCES networks(network_id),
+        UNIQUE(network_id, device_id, endpoint)
+    );
+    INSERT INTO device_endpoints_v6(id,device_id,endpoint,first_seen,last_seen,hits,protocol,network_id)
+        SELECT id,device_id,endpoint,first_seen,last_seen,hits,protocol,network_id FROM device_endpoints;
+    DROP TABLE device_endpoints;
+    ALTER TABLE device_endpoints_v6 RENAME TO device_endpoints;
+    CREATE INDEX idx_endpoints_network ON device_endpoints(network_id);
+    CREATE INDEX idx_endpoints_device ON device_endpoints(device_id);
+
+    DROP INDEX IF EXISTS idx_relationships_device;
+    DROP INDEX IF EXISTS idx_relationships_target;
+    DROP INDEX IF EXISTS idx_relationships_relation;
+    DROP INDEX IF EXISTS idx_relationships_network;
+    CREATE TABLE network_relationships_v6 (
+        id INTEGER PRIMARY KEY,
+        device_id INTEGER,
+        relation TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_value TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_value TEXT NOT NULL,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        hits INTEGER NOT NULL DEFAULT 1,
+        protocol TEXT,
+        metadata TEXT,
+        network_id INTEGER,
+        FOREIGN KEY(device_id) REFERENCES devices(device_id),
+        FOREIGN KEY(network_id) REFERENCES networks(network_id),
+        UNIQUE(network_id, device_id, relation, source_type, source_value, target_type, target_value)
+    );
+    INSERT INTO network_relationships_v6(id,device_id,relation,source_type,source_value,target_type,target_value,first_seen,last_seen,hits,protocol,metadata,network_id)
+        SELECT id,device_id,relation,source_type,source_value,target_type,target_value,first_seen,last_seen,hits,protocol,metadata,network_id FROM network_relationships;
+    DROP TABLE network_relationships;
+    ALTER TABLE network_relationships_v6 RENAME TO network_relationships;
+    CREATE INDEX idx_relationships_device ON network_relationships(device_id);
+    CREATE INDEX idx_relationships_target ON network_relationships(target_type, target_value);
+    CREATE INDEX idx_relationships_relation ON network_relationships(relation);
+    CREATE INDEX idx_relationships_network ON network_relationships(network_id);
+    """),
 ]
 
 
