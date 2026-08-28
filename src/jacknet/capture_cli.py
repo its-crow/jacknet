@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .capture import capture_ready, ingest_capture, list_interfaces, live_capture
+from .capture import capture_ready, ingest_capture, list_interfaces, live_capture, tshark_path
 from .config import paths
 from .dossier import all_devices, dossier_for_ip
 from .learning import learn as run_learning
@@ -28,6 +29,59 @@ def interfaces_cmd():
     t=Table(title="JACKNET / CAPTURE INTERFACES"); t.add_column("ID"); t.add_column("Interface", overflow="fold")
     for num,desc in rows: t.add_row(num,desc)
     console.print(t)
+
+
+@capture_app.command("probe")
+def probe_cmd(duration: int = typer.Option(2, "-d", "--duration", min=1, max=10)):
+    """Test Npcap interfaces and show which ones are actually receiving packets."""
+    exe = tshark_path()
+    if not exe:
+        console.print(Panel("TShark was not found.", title="JACKNET / CAPTURE PROBE", style="red")); raise typer.Exit(2)
+
+    rows = [(num, desc) for num, desc in list_interfaces() if "NPF_" in desc]
+    if not rows:
+        console.print(Panel("No local Npcap interfaces were found.", title="JACKNET / CAPTURE PROBE", style="yellow")); raise typer.Exit(2)
+
+    table = Table(title=f"JACKNET / CAPTURE PROBE • {duration}s per interface")
+    table.add_column("ID")
+    table.add_column("Packets", justify="right")
+    table.add_column("Status")
+    table.add_column("Interface", overflow="fold")
+    best_id = None
+    best_packets = -1
+
+    for num, desc in rows:
+        console.print(f"[dim]Probing interface {num}...[/]")
+        try:
+            proc = subprocess.run(
+                [exe, "-n", "-i", num, "-a", f"duration:{duration}", "-T", "fields", "-e", "frame.number"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=duration + 8,
+            )
+            packets = sum(1 for line in proc.stdout.splitlines() if line.strip())
+            if proc.returncode and packets == 0:
+                status = "ERROR"
+            elif packets:
+                status = "ACTIVE"
+            else:
+                status = "QUIET"
+            if packets > best_packets:
+                best_packets = packets
+                best_id = num
+        except (OSError, subprocess.TimeoutExpired):
+            packets = 0
+            status = "ERROR"
+        table.add_row(num, str(packets), status, desc)
+
+    console.print(table)
+    if best_id is not None and best_packets > 0:
+        console.print(Panel(f"Best capture interface: [bold cyan]{best_id}[/] • {best_packets:,} packets observed\nTry: jacknet capture live -i {best_id} --duration 30", title="JACKNET / RECOMMENDATION"))
+    else:
+        console.print(Panel("No Npcap interface produced packets. Check that Npcap is running and try an elevated PowerShell session.", title="JACKNET / CAPTURE PROBE", style="yellow"))
 
 
 @capture_app.command("analyze")
@@ -56,7 +110,15 @@ def live_cmd(interface: str = typer.Option(...,"-i","--interface"), duration: in
     out=output or paths()["cache"] / f"capture-{stamp}.pcapng"
     try:
         console.print(f"[bold]JACKNET / CAPTURE[/] interface [cyan]{interface}[/] • {duration}s")
-        live_capture(interface,out,duration,monitor); stats=ingest_capture(out,source="live",interface=interface); learned=run_learning()
+        live_capture(interface,out,duration,monitor)
+        stats=ingest_capture(out,source="live",interface=interface)
+        if stats["packets"] == 0:
+            raise RuntimeError(
+                f"Capture completed but interface {interface} produced 0 packets. "
+                "This usually means the interface is inactive or not the adapter carrying your traffic. "
+                "Run 'jacknet capture probe' to find the active capture interface."
+            )
+        learned=run_learning()
     except Exception as exc: console.print(Panel(str(exc),title="JACKNET / CAPTURE ERROR",style="red")); raise typer.Exit(2)
     console.print(Panel(f"Packets: {stats['packets']:,}\nDevices linked: {stats['devices']}\nCapture: {out}\nFingerprints promoted: {learned['promoted']}",title="JACKNET / CAPTURE COMPLETE"))
 
