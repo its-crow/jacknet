@@ -9,3 +9,9 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Jacknet runtime data / captures
+data/
+*.pcap
+*.pcapng
+*.jnet
