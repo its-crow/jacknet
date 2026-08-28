@@ -38,6 +38,7 @@ def _device_from_payload(payload: str) -> Device:
 
 
 def _persistent_features(con, device_id: int) -> set[tuple[str,str]]:
+    """Return stable dossier features, requiring repeated passive evidence across capture sessions."""
     out=set()
     rows=con.execute("""SELECT feature_type,feature_value,COUNT(*) AS n
         FROM device_features WHERE device_id=? GROUP BY feature_type,feature_value HAVING n>=2""",(device_id,)).fetchall()
@@ -49,9 +50,40 @@ def _persistent_features(con, device_id: int) -> set[tuple[str,str]]:
             if m: out.add(("hostname_prefix",m.group(0)))
         elif ft in {"open_port","observed_port"}:
             out.add(("port",val))
-        elif ft in {"dns","tls_sni","http_host","mdns_name","ssdp_server"}:
+        elif ft in {"dns","tls_sni","http_host","mdns_name","ssdp_server","service","protocol"}:
             out.add((ft,val))
+
+    # Passive packet evidence is intentionally promoted by capture-session support,
+    # not raw packet count. One noisy capture cannot manufacture certainty.
+    passive=con.execute("""
+        SELECT artifact_type,artifact_value,COUNT(DISTINCT session_id) AS sessions
+        FROM network_artifacts
+        WHERE device_id=? AND session_id IS NOT NULL
+          AND artifact_type IN ('domain','tls_sni','http_host','mdns_name','hostname','service','protocol','ssdp_server')
+        GROUP BY artifact_type,artifact_value
+        HAVING sessions>=2
+    """,(device_id,)).fetchall()
+    for ft,val,_ in passive:
+        ft=_norm(ft); val=_norm(val)
+        if not val: continue
+        if ft=="domain": out.add(("dns",val))
+        elif ft=="hostname":
+            h=val.split('.')[0]; m=re.match(r"[a-z][a-z_-]{1,15}",h)
+            if m: out.add(("hostname_prefix",m.group(0)))
+        else: out.add((ft,val))
     return out
+
+
+def _device_id_for(con, device: Device) -> int | None:
+    """Resolve a current scan Device to its persistent dossier without trusting IP over a known MAC."""
+    if device.mac:
+        row=con.execute("SELECT device_id FROM devices WHERE lower(canonical_mac)=lower(?) LIMIT 1",(device.mac,)).fetchone()
+        if row: return int(row[0])
+        return None
+    if device.ip:
+        row=con.execute("SELECT device_id FROM device_addresses WHERE ip=? ORDER BY last_seen DESC LIMIT 1",(device.ip,)).fetchone()
+        if row: return int(row[0])
+    return None
 
 
 def find_latest(ip: str):
@@ -127,14 +159,18 @@ def learn():
 
 
 def apply_learned(device: Device) -> Device:
+    """Apply active fingerprints using current evidence plus the device's persistent dossier."""
     try: migrate()
     except Exception: return device
     feats=device_features(device)
-    if not feats: return device
-    scores=defaultdict(float); matches=defaultdict(list)
     with connect() as con:
+        did=_device_id_for(con,device)
+        if did is not None:
+            feats |= _persistent_features(con,did)
         rows=con.execute("""SELECT f.id,f.model,f.device_type,ff.feature_type,ff.pattern,ff.weight
             FROM fingerprints f JOIN fingerprint_features ff ON ff.fingerprint_id=f.id WHERE f.status='active'""").fetchall()
+    if not feats: return device
+    scores=defaultdict(float); matches=defaultdict(list)
     for fid,model,typ,ft,pat,w in rows:
         if (ft,pat) in feats:
             scores[(fid,model,typ)] += w; matches[(fid,model,typ)].append((ft,pat,w))
