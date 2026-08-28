@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -20,106 +20,68 @@ capture_app = typer.Typer(help="Capture and analyze Wi-Fi/LAN traffic with Wires
 console = Console()
 
 
-def _windows_physical_adapters() -> list[dict[str, str]]:
-    """Return Windows physical Ethernet/Wi-Fi adapters that are currently Up."""
-    if os.name != "nt":
-        return []
-    script = (
-        "Get-NetAdapter -Physical | "
-        "Where-Object {$_.Status -eq 'Up'} | "
-        "Select-Object Name,InterfaceDescription,InterfaceGuid,MediaType,LinkSpeed | "
-        "ConvertTo-Json -Compress"
+_BLOCKED_CAPTURE_NAMES = (
+    "loopback", "npcap loopback", "local area connection*", "usbpcap",
+    "ciscodump", "etwdump", "randpkt", "sshdump", "udpdump", "wifidump",
+    "wi-fi direct", "wifi direct", "bluetooth", "virtual", "hyper-v", "vpn", "tunnel", "tap",
+)
+
+
+def _friendly_capture_name(description: str) -> str:
+    matches = re.findall(r"\(([^()]*)\)", description)
+    return matches[-1].strip() if matches else description.strip()
+
+
+def _is_real_lan_interface(description: str) -> bool:
+    """Accept only user-facing Ethernet or Wi-Fi interfaces, never loopback/extcap/virtual sources."""
+    friendly = _friendly_capture_name(description)
+    text = f"{description} {friendly}".lower()
+    if any(token in text for token in _BLOCKED_CAPTURE_NAMES):
+        return False
+    normalized = friendly.lower().replace("_", "-")
+    return (
+        normalized == "wi-fi"
+        or normalized == "wifi"
+        or normalized.startswith("wi-fi ")
+        or normalized.startswith("wifi ")
+        or normalized == "ethernet"
+        or normalized.startswith("ethernet ")
     )
-    try:
-        proc = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    if proc.returncode or not proc.stdout.strip():
-        return []
-    try:
-        raw = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(raw, dict):
-        raw = [raw]
+
+
+def _capture_candidates() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        media = str(item.get("MediaType") or "").lower()
-        name = str(item.get("Name") or "")
-        desc = str(item.get("InterfaceDescription") or "")
-        # Windows sometimes reports 802.3/Native 802.11 rather than friendly media names.
-        text = f"{media} {name} {desc}".lower()
-        if not any(token in text for token in ("802.3", "802.11", "ethernet", "wi-fi", "wifi", "wireless")):
+    for num, desc in list_interfaces():
+        if not _is_real_lan_interface(desc):
             continue
         rows.append({
-            "name": name,
+            "id": num,
+            "capture": desc,
+            "name": _friendly_capture_name(desc),
             "description": desc,
-            "guid": str(item.get("InterfaceGuid") or "").strip("{}"),
-            "media": str(item.get("MediaType") or ""),
-            "link_speed": str(item.get("LinkSpeed") or ""),
+            "link_speed": "",
         })
     return rows
 
 
-def _capture_candidates() -> list[dict[str, str]]:
-    """Match active physical Windows NICs to TShark interface IDs."""
-    tshark_rows = list_interfaces()
-    if os.name != "nt":
-        return [
-            {"id": num, "capture": desc, "name": desc, "description": desc, "link_speed": ""}
-            for num, desc in tshark_rows
-            if "loopback" not in desc.lower()
-        ]
-
-    physical = _windows_physical_adapters()
-    candidates: list[dict[str, str]] = []
-    for adapter in physical:
-        guid = adapter["guid"].lower()
-        name = adapter["name"].lower()
-        desc = adapter["description"].lower()
-        for num, capture_desc in tshark_rows:
-            haystack = capture_desc.lower()
-            if (guid and guid in haystack) or (name and f"({name})" in haystack) or (desc and desc in haystack):
-                candidates.append({
-                    "id": num,
-                    "capture": capture_desc,
-                    "name": adapter["name"],
-                    "description": adapter["description"],
-                    "link_speed": adapter["link_speed"],
-                })
-                break
-    return candidates
-
-
 @capture_app.command("interfaces")
 def interfaces_cmd():
-    """Show active physical Ethernet/Wi-Fi capture interfaces."""
+    """Show Ethernet/Wi-Fi capture interfaces only."""
     ok, note = capture_ready()
     if not ok:
         console.print(Panel(note, title="JACKNET / CAPTURE", style="yellow")); raise typer.Exit(2)
     rows = _capture_candidates()
-    t = Table(title="JACKNET / PHYSICAL CAPTURE INTERFACES")
+    t = Table(title="JACKNET / NETWORK CAPTURE INTERFACES")
     t.add_column("ID")
     t.add_column("Adapter")
-    t.add_column("Link")
     t.add_column("TShark interface", overflow="fold")
     for row in rows:
-        t.add_row(row["id"], row["name"], row["link_speed"] or "—", row["capture"])
+        t.add_row(row["id"], row["name"], row["capture"])
     console.print(t)
     if not rows:
         console.print(Panel(
-            "No active physical Ethernet/Wi-Fi adapter could be matched to TShark. "
-            "Run 'Get-NetAdapter -Physical' in PowerShell to verify Windows sees an Up hardware adapter.",
+            "TShark did not expose a usable Ethernet or Wi-Fi interface. Jacknet deliberately ignores loopback, "
+            "Wi-Fi Direct, USBPcap, virtual adapters, and extcap sources.",
             title="JACKNET / CAPTURE",
             style="yellow",
         ))
@@ -127,7 +89,7 @@ def interfaces_cmd():
 
 @capture_app.command("probe")
 def probe_cmd(duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)):
-    """Probe active physical Ethernet/Wi-Fi adapters and find one receiving packets."""
+    """Probe Ethernet/Wi-Fi adapters and find one receiving packets."""
     exe = tshark_path()
     if not exe:
         console.print(Panel("TShark was not found.", title="JACKNET / CAPTURE PROBE", style="red")); raise typer.Exit(2)
@@ -135,19 +97,17 @@ def probe_cmd(duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)
     rows = _capture_candidates()
     if not rows:
         console.print(Panel(
-            "No active physical Ethernet/Wi-Fi capture interfaces were found. "
-            "Jacknet will not probe loopback, virtual, USBPcap, or extcap interfaces.",
+            "No Ethernet/Wi-Fi capture interfaces were found. Jacknet will not fall back to loopback or virtual adapters.",
             title="JACKNET / CAPTURE PROBE",
-            style="yellow",
+            style="red",
         ))
         raise typer.Exit(2)
 
-    table = Table(title=f"JACKNET / PHYSICAL CAPTURE PROBE • {duration}s per interface")
+    table = Table(title=f"JACKNET / NETWORK CAPTURE PROBE • {duration}s per interface")
     table.add_column("ID")
     table.add_column("Adapter")
     table.add_column("Packets", justify="right")
     table.add_column("Status")
-    table.add_column("Link")
     best: dict[str, str] | None = None
     best_packets = -1
 
@@ -180,7 +140,7 @@ def probe_cmd(duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)
             packets = 0
             status = "ERROR"
             stderr = str(exc)
-        table.add_row(num, row["name"], str(packets), status, row["link_speed"] or "—")
+        table.add_row(num, row["name"], str(packets), status)
         if status == "ERROR" and stderr:
             console.print(f"[red]  {stderr}[/]")
 
@@ -194,13 +154,9 @@ def probe_cmd(duration: int = typer.Option(3, "-d", "--duration", min=1, max=10)
         ))
     else:
         console.print(Panel(
-            "Windows reports the physical adapter as Up, but TShark received zero packets from it.\n\n"
-            "This is now a capture-backend problem rather than interface selection. On Windows, verify:\n"
-            "• PowerShell is running as Administrator\n"
-            "• the Npcap Packet Driver service is running\n"
-            "• Npcap was installed with WinPcap API compatibility disabled unless required\n"
-            "• for raw Wi-Fi/monitor capture, Npcap was installed with 802.11 traffic support\n\n"
-            "Jacknet will not pretend loopback traffic is a valid network capture.",
+            "Jacknet found the real Ethernet/Wi-Fi adapter, but TShark received zero packets from it.\n\n"
+            "This is a Windows/Npcap capture-backend problem, not an interface-selection problem. "
+            "Jacknet will not substitute loopback traffic and call it success.",
             title="JACKNET / CAPTURE BACKEND FAILURE",
             style="red",
         ))
@@ -216,9 +172,12 @@ def analyze_cmd(path: Path = typer.Argument(..., exists=True, readable=True), js
     except Exception as exc: console.print(Panel(str(exc),title="JACKNET / CAPTURE ERROR",style="red")); raise typer.Exit(2)
     stats["learning"]=learned
     if json_out: typer.echo(json.dumps(stats,indent=2)); return
-    body=(f"Capture: {stats['capture']}\nPackets learned: {stats['packets']:,}\nDevices linked: {stats['devices']}\n"
-          f"Local IPs: {stats['local_ips']}\nExternal endpoints: {stats['external_endpoints']}\nDNS names: {stats['dns_names']}\n"
-          f"Learning examples: {learned['examples']} • fingerprints promoted: {learned['promoted']}")
+    body=(f"Capture: {stats['capture']}\nPackets: {stats['packets']:,}\nFull decodes stored: {stats.get('decoded_packets',0):,}\n"
+          f"Artifacts extracted: {stats.get('artifacts',0):,}\nGraph relationships: {stats.get('relationships',0):,}\n"
+          f"Devices linked: {stats['devices']}\nLocal IPs: {stats['local_ips']}\nExternal endpoints: {stats['external_endpoints']}\n"
+          f"DNS names: {stats['dns_names']}\nLearning examples: {learned['examples']} • fingerprints promoted: {learned['promoted']}")
+    if stats.get("decode_error"):
+        body += f"\nFull-decode warning: {stats['decode_error']}"
     console.print(Panel(body,title="JACKNET / CAPTURE ANALYSIS"))
     if stats['protocols']:
         t=Table(title="Top protocols"); t.add_column("Protocol"); t.add_column("Packets",justify="right")
@@ -228,12 +187,12 @@ def analyze_cmd(path: Path = typer.Argument(..., exists=True, readable=True), js
 
 @capture_app.command("live")
 def live_cmd(interface: str = typer.Option(...,"-i","--interface"), duration: int = typer.Option(60,"-d","--duration",min=1), monitor: bool = typer.Option(False,"--monitor",help="Request monitor mode from the capture backend"), output: Path | None = typer.Option(None,"-o","--output")):
-    """Capture traffic, then immediately ingest it into JackNet's learning database."""
+    """Capture traffic, then immediately ingest all decodable evidence into Jacknet."""
     valid_ids = {row["id"] for row in _capture_candidates()}
-    if valid_ids and interface not in valid_ids:
+    if interface not in valid_ids:
+        allowed = ", ".join(sorted(valid_ids)) or "none"
         console.print(Panel(
-            f"Interface {interface} is not an active physical Ethernet/Wi-Fi adapter. "
-            f"Allowed interfaces: {', '.join(sorted(valid_ids))}",
+            f"Interface {interface} is not an Ethernet/Wi-Fi capture adapter. Allowed interfaces: {allowed}",
             title="JACKNET / CAPTURE ERROR",
             style="red",
         ))
@@ -246,12 +205,17 @@ def live_cmd(interface: str = typer.Option(...,"-i","--interface"), duration: in
         stats=ingest_capture(out,source="live",interface=interface)
         if stats["packets"] == 0:
             raise RuntimeError(
-                f"Capture completed but physical interface {interface} produced 0 packets. "
+                f"Capture completed but network interface {interface} produced 0 packets. "
                 "Jacknet will not mark this as success. Run 'jacknet capture probe' for backend diagnostics."
             )
         learned=run_learning()
     except Exception as exc: console.print(Panel(str(exc),title="JACKNET / CAPTURE ERROR",style="red")); raise typer.Exit(2)
-    console.print(Panel(f"Packets: {stats['packets']:,}\nDevices linked: {stats['devices']}\nCapture: {out}\nFingerprints promoted: {learned['promoted']}",title="JACKNET / CAPTURE COMPLETE"))
+    body=(f"Packets: {stats['packets']:,}\nFull decodes stored: {stats.get('decoded_packets',0):,}\n"
+          f"Artifacts extracted: {stats.get('artifacts',0):,}\nGraph relationships: {stats.get('relationships',0):,}\n"
+          f"Devices linked: {stats['devices']}\nCapture: {out}\nFingerprints promoted: {learned['promoted']}")
+    if stats.get("decode_error"):
+        body += f"\nFull-decode warning: {stats['decode_error']}"
+    console.print(Panel(body,title="JACKNET / CAPTURE COMPLETE"))
 
 
 def dossier_cmd(ip: str = typer.Argument(...), json_out: bool = typer.Option(False,"--json")):
