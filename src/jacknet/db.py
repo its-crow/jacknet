@@ -229,6 +229,53 @@ MIGRATIONS: list[tuple[int, str]] = [
     CREATE INDEX IF NOT EXISTS idx_relationships_target ON network_relationships(target_type, target_value);
     CREATE INDEX IF NOT EXISTS idx_relationships_relation ON network_relationships(relation);
     """),
+    (5, """
+    CREATE TABLE IF NOT EXISTS networks (
+        network_id INTEGER PRIMARY KEY,
+        network_key TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        cidr TEXT,
+        gateway_ip TEXT,
+        gateway_mac TEXT,
+        ssid TEXT,
+        interface TEXT,
+        interface_description TEXT,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_networks_gateway ON networks(gateway_mac, gateway_ip);
+    CREATE INDEX IF NOT EXISTS idx_networks_ssid ON networks(ssid);
+
+    CREATE TABLE IF NOT EXISTS device_network_addresses (
+        id INTEGER PRIMARY KEY,
+        network_id INTEGER NOT NULL,
+        device_id INTEGER NOT NULL,
+        ip TEXT NOT NULL,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        observation_count INTEGER NOT NULL DEFAULT 1,
+        source TEXT NOT NULL,
+        FOREIGN KEY(network_id) REFERENCES networks(network_id),
+        FOREIGN KEY(device_id) REFERENCES devices(device_id),
+        UNIQUE(network_id, device_id, ip)
+    );
+    CREATE INDEX IF NOT EXISTS idx_dna_network_ip ON device_network_addresses(network_id, ip);
+    CREATE INDEX IF NOT EXISTS idx_dna_device ON device_network_addresses(device_id);
+
+    ALTER TABLE observations ADD COLUMN network_id INTEGER REFERENCES networks(network_id);
+    ALTER TABLE capture_sessions ADD COLUMN network_id INTEGER REFERENCES networks(network_id);
+    ALTER TABLE traffic_observations ADD COLUMN network_id INTEGER REFERENCES networks(network_id);
+    ALTER TABLE network_artifacts ADD COLUMN network_id INTEGER REFERENCES networks(network_id);
+    ALTER TABLE network_relationships ADD COLUMN network_id INTEGER REFERENCES networks(network_id);
+    ALTER TABLE device_endpoints ADD COLUMN network_id INTEGER REFERENCES networks(network_id);
+
+    CREATE INDEX IF NOT EXISTS idx_obs_network_ip ON observations(network_id, ip);
+    CREATE INDEX IF NOT EXISTS idx_capture_network ON capture_sessions(network_id);
+    CREATE INDEX IF NOT EXISTS idx_traffic_network ON traffic_observations(network_id);
+    CREATE INDEX IF NOT EXISTS idx_artifacts_network ON network_artifacts(network_id);
+    CREATE INDEX IF NOT EXISTS idx_relationships_network ON network_relationships(network_id);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_network ON device_endpoints(network_id);
+    """),
 ]
 
 
