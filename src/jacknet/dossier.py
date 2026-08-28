@@ -3,6 +3,20 @@ from __future__ import annotations
 from .db import connect, migrate
 
 
+def _mac_type(mac: str | None) -> str:
+    if not mac:
+        return "unknown"
+    try:
+        first = int(mac.split(":")[0], 16)
+    except (ValueError, IndexError):
+        return "unknown"
+    if first & 1:
+        return "multicast"
+    if first & 2:
+        return "private/local"
+    return "global"
+
+
 def dossier_for_ip(ip: str) -> dict | None:
     migrate()
     with connect() as con:
@@ -21,7 +35,7 @@ def dossier_for_ip(ip: str) -> dict | None:
         traffic=con.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0),MIN(observed_at),MAX(observed_at) FROM traffic_observations WHERE device_id=?",(did,)).fetchone()
         protocols=con.execute("SELECT protocol,COUNT(*) FROM traffic_observations WHERE device_id=? AND protocol IS NOT NULL GROUP BY protocol ORDER BY COUNT(*) DESC LIMIT 20",(did,)).fetchall()
         return {
-            "device_id":did,"canonical_mac":row[1],"first_seen":row[2],"last_seen":row[3],"user_label":row[4],
+            "device_id":did,"canonical_mac":row[1],"mac_type":_mac_type(row[1]),"first_seen":row[2],"last_seen":row[3],"user_label":row[4],
             "manufacturer":row[5],"model":row[6],"device_type":row[7],"confidence":row[8],"queried_ip":ip,
             "addresses":[{"ip":x[0],"first_seen":x[1],"last_seen":x[2],"observations":x[3],"source":x[4]} for x in addresses],
             "endpoints":[{"endpoint":x[0],"first_seen":x[1],"last_seen":x[2],"hits":x[3],"protocol":x[4]} for x in endpoints],
@@ -34,7 +48,8 @@ def all_devices() -> list[dict]:
     migrate()
     with connect() as con:
         rows=con.execute("""SELECT d.device_id,d.canonical_mac,d.user_label,d.manufacturer,d.model,d.device_type,d.confidence,d.first_seen,d.last_seen,
-            (SELECT GROUP_CONCAT(ip, ', ') FROM device_addresses a WHERE a.device_id=d.device_id),
+            (SELECT ip FROM device_addresses a WHERE a.device_id=d.device_id ORDER BY a.last_seen DESC LIMIT 1),
+            (SELECT COUNT(*) FROM device_addresses a WHERE a.device_id=d.device_id),
             (SELECT COUNT(*) FROM traffic_observations t WHERE t.device_id=d.device_id)
             FROM devices d ORDER BY d.last_seen DESC""").fetchall()
-    return [{"device_id":r[0],"mac":r[1],"label":r[2],"manufacturer":r[3],"model":r[4],"device_type":r[5],"confidence":r[6],"first_seen":r[7],"last_seen":r[8],"ips":r[9],"traffic_packets":r[10]} for r in rows]
+    return [{"device_id":r[0],"mac":r[1],"mac_type":_mac_type(r[1]),"label":r[2],"manufacturer":r[3],"model":r[4],"device_type":r[5],"confidence":r[6],"first_seen":r[7],"last_seen":r[8],"current_ip":r[9],"address_count":r[10],"traffic_packets":r[11]} for r in rows]
