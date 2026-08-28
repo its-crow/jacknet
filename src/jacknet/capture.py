@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .db import connect, migrate
+from .evidence import ingest_full_decode
 
 
 TSHARK_FIELDS = [
@@ -145,7 +146,6 @@ def supported_tshark_fields() -> frozenset[str]:
 def active_tshark_fields() -> list[str]:
     supported = supported_tshark_fields()
     if not supported:
-        # If capability discovery itself fails, use the conservative core only.
         return [
             "frame.time_epoch", "frame.len", "eth.src", "eth.dst",
             "ip.src", "ip.dst", "ipv6.src", "ipv6.dst",
@@ -366,6 +366,14 @@ def ingest_capture(path: Path, source: str = "pcap", interface: str | None = Non
         ended = _now()
         con.execute("UPDATE capture_sessions SET ended_at=?,packet_count=? WHERE id=?", (ended, packet_count, session_id))
 
+    decode_stats: dict[str, int | str] = {"decoded_packets": 0, "artifacts": 0, "relationships": 0}
+    exe = tshark_path()
+    if exe and packet_count:
+        try:
+            decode_stats.update(ingest_full_decode(path, session_id, exe))
+        except Exception as exc:
+            decode_stats["decode_error"] = str(exc)
+
     return {
         "session_id": session_id,
         "capture": str(path),
@@ -375,6 +383,7 @@ def ingest_capture(path: Path, source: str = "pcap", interface: str | None = Non
         "external_endpoints": len(external_endpoints),
         "dns_names": len(dns_names),
         "protocols": dict(sorted(protocol_counts.items(), key=lambda kv: kv[1], reverse=True)[:20]),
+        **decode_stats,
     }
 
 
