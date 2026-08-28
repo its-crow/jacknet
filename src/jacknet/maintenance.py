@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from .capture import ingest_capture
+from .config import paths
 from .db import connect, migrate
 from .network_context import ensure_network, get_network
 
@@ -17,32 +18,74 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _retained_capture_files() -> list[tuple[str, str | None, str | None, int | None]]:
+    """Return registered captures plus orphan PCAPs still present in JackNet's cache.
+
+    A capture process can successfully write a PCAP before database ingestion fails.
+    Those files are valuable evidence and must remain recoverable.
+    """
+    files: list[tuple[str, str | None, str | None, int | None]] = []
+    seen: set[str] = set()
+    with connect() as con:
+        for capture_file, source, interface, network_id in con.execute(
+            "SELECT capture_file,source,interface,network_id FROM capture_sessions WHERE capture_file IS NOT NULL ORDER BY id"
+        ):
+            p = Path(capture_file)
+            if not p.exists():
+                continue
+            key = str(p.resolve())
+            if key not in seen:
+                files.append((key, source, interface, network_id))
+                seen.add(key)
+
+    cache = paths()["cache"]
+    if cache.exists():
+        for pattern in ("*.pcapng", "*.pcap"):
+            for p in sorted(cache.glob(pattern)):
+                key = str(p.resolve())
+                if key not in seen:
+                    # No database session survived for this file, so its historical
+                    # network is unknown. Rebuild will explicitly use current context.
+                    files.append((key, "recovered", None, None))
+                    seen.add(key)
+    return files
+
+
 def evidence_rebuild_cmd(yes: bool = typer.Option(False,"--yes",help="Confirm rebuilding passive evidence from retained capture files")):
     """Discard derived passive state and reconstruct it from retained PCAP/PCAPNG files."""
     migrate()
-    with connect() as con:
-        files=[]
-        seen=set()
-        for capture_file,source,interface,network_id in con.execute("SELECT capture_file,source,interface,network_id FROM capture_sessions WHERE capture_file IS NOT NULL ORDER BY id"):
-            p=Path(capture_file); key=str(p.resolve()) if p.exists() else str(p)
-            if p.exists() and key not in seen:
-                files.append((key,source,interface,network_id));seen.add(key)
+    files = _retained_capture_files()
     if not files:
         console.print(Panel("No retained capture files were found. Nothing was changed.",title="JACKNET / EVIDENCE REBUILD",style="yellow"));return
-    console.print(Panel(f"Found {len(files)} retained capture file(s).\n\nThis will delete DERIVED passive evidence, relationships, traffic rows, passive network-scoped addresses, and passive-only pseudo-devices, then decode the captures again. Active scan observations, confirmations, labels, corrections, fingerprints, and network identities are preserved.",title="JACKNET / EVIDENCE REBUILD"))
+    console.print(Panel(f"Found {len(files)} retained capture file(s).\n\nThis will delete DERIVED passive evidence, relationships, traffic rows, and passive network-scoped addresses, then decode the captures again. Active scan observations, device records, confirmations, labels, corrections, fingerprints, and network identities are preserved.\n\nOrphan capture files that exist on disk without a surviving database session are recovered automatically.",title="JACKNET / EVIDENCE REBUILD"))
     if not yes and not typer.confirm("Rebuild passive evidence now?"):raise typer.Abort()
+
+    # Do not delete devices here. A device can be referenced by several historical
+    # tables that intentionally outlive passive evidence. Device cleanup belongs in
+    # a separate, reference-aware maintenance operation.
     with connect() as con:
-        con.execute("DELETE FROM packet_decodes");con.execute("DELETE FROM network_artifacts");con.execute("DELETE FROM network_relationships");con.execute("DELETE FROM traffic_observations");con.execute("DELETE FROM device_endpoints")
-        con.execute("DELETE FROM device_features WHERE source IN ('live','pcap','tshark-decode')")
-        con.execute("DELETE FROM device_network_addresses WHERE source IN ('live','pcap')")
+        con.execute("DELETE FROM packet_decodes")
+        con.execute("DELETE FROM network_artifacts")
+        con.execute("DELETE FROM network_relationships")
+        con.execute("DELETE FROM traffic_observations")
+        con.execute("DELETE FROM device_endpoints")
+        con.execute("DELETE FROM device_features WHERE source IN ('live','pcap','recovered','tshark-decode')")
+        con.execute("DELETE FROM device_network_addresses WHERE source IN ('live','pcap','recovered')")
         con.execute("DELETE FROM capture_sessions")
-        con.execute("""DELETE FROM devices WHERE device_id NOT IN (SELECT DISTINCT device_id FROM observations WHERE device_id IS NOT NULL) AND device_id NOT IN (SELECT DISTINCT device_id FROM labels) AND device_id NOT IN (SELECT DISTINCT device_id FROM device_network_addresses)""")
+
     total_packets=total_artifacts=0;failures=[]
     for i,(path,source,interface,network_id) in enumerate(files,1):
-        label=get_network(int(network_id)).name if network_id is not None and get_network(int(network_id)) else "current/legacy network"
+        stored_network = get_network(int(network_id)) if network_id is not None else None
+        label = stored_network.name if stored_network else "current network (legacy/orphan capture)"
         console.print(f"[dim]Re-decoding {i}/{len(files)} [{label}]: {path}[/]")
         try:
-            stats=ingest_capture(Path(path),source=source or "pcap",interface=interface,network_id_override=int(network_id) if network_id is not None else None);total_packets+=int(stats.get("packets",0));total_artifacts+=int(stats.get("artifacts",0))
+            stats=ingest_capture(
+                Path(path),
+                source=source or "pcap",
+                interface=interface,
+                network_id_override=int(network_id) if network_id is not None else None,
+            )
+            total_packets+=int(stats.get("packets",0));total_artifacts+=int(stats.get("artifacts",0))
         except Exception as exc:failures.append(f"{path}: {exc}")
     body=f"Captures rebuilt: {len(files)-len(failures)}/{len(files)}\nPackets reprocessed: {total_packets:,}\nArtifacts rebuilt: {total_artifacts:,}"
     if failures:body+="\nFailures:\n"+"\n".join(failures[:10])
