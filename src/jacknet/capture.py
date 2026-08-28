@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import shutil
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -28,11 +30,11 @@ TSHARK_FIELDS = [
     "udp.dstport",
     "_ws.col.Protocol",
     "dns.qry.name",
+    "dns.resp.name",
     "tls.handshake.extensions_server_name",
     "http.host",
     "dhcp.option.hostname",
     "bootp.option.hostname",
-    "mdns.dns_resp_name",
     "ssdp.server",
     "ssdp.usn",
     "wlan.sa",
@@ -67,18 +69,35 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _find_wireshark_tool(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    if os.name == "nt":
+        exe = name if name.lower().endswith(".exe") else f"{name}.exe"
+        roots = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Wireshark",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Wireshark",
+        ]
+        for root in roots:
+            candidate = root / exe
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
 def tshark_path() -> str | None:
-    return shutil.which("tshark")
+    return _find_wireshark_tool("tshark")
 
 
 def dumpcap_path() -> str | None:
-    return shutil.which("dumpcap")
+    return _find_wireshark_tool("dumpcap")
 
 
 def capture_ready() -> tuple[bool, str]:
     tshark = tshark_path()
     if not tshark:
-        return False, "TShark was not found. Install Wireshark with TShark enabled and ensure it is on PATH."
+        return False, "TShark was not found. Install Wireshark with TShark enabled."
     return True, tshark
 
 
@@ -97,7 +116,46 @@ def list_interfaces() -> list[tuple[str, str]]:
     return rows
 
 
-def _first(*values: str) -> str | None:
+@lru_cache(maxsize=1)
+def supported_tshark_fields() -> frozenset[str]:
+    """Return display-filter field names supported by this installed TShark."""
+    exe = tshark_path()
+    if not exe:
+        return frozenset()
+    try:
+        proc = subprocess.run(
+            [exe, "-G", "fields"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return frozenset()
+    fields: set[str] = set()
+    for line in proc.stdout.splitlines():
+        cols = line.split("\t")
+        if len(cols) >= 3 and cols[0] == "F":
+            fields.add(cols[2].strip())
+    return frozenset(fields)
+
+
+def active_tshark_fields() -> list[str]:
+    supported = supported_tshark_fields()
+    if not supported:
+        # If capability discovery itself fails, use the conservative core only.
+        return [
+            "frame.time_epoch", "frame.len", "eth.src", "eth.dst",
+            "ip.src", "ip.dst", "ipv6.src", "ipv6.dst",
+            "tcp.srcport", "tcp.dstport", "udp.srcport", "udp.dstport",
+            "_ws.col.Protocol",
+        ]
+    return [field for field in TSHARK_FIELDS if field in supported]
+
+
+def _first(*values: str | None) -> str | None:
     for value in values:
         value = (value or "").strip()
         if value:
@@ -112,9 +170,9 @@ def _to_int(value: str | None) -> int | None:
         return None
 
 
-def _iso_from_epoch(value: str) -> str:
+def _iso_from_epoch(value: str | None) -> str:
     try:
-        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(float(value or ""), tz=timezone.utc).isoformat()
     except (TypeError, ValueError, OSError):
         return _now()
 
@@ -126,44 +184,62 @@ def iter_capture(path: Path) -> Iterable[TrafficRecord]:
     if not path.exists():
         raise FileNotFoundError(path)
 
+    fields = active_tshark_fields()
+    if not fields:
+        raise RuntimeError("TShark is installed, but Jacknet could not discover any usable fields.")
+
     cmd = [exe, "-n", "-r", str(path), "-T", "fields", "-E", "separator=\t", "-E", "quote=d", "-E", "occurrence=f"]
-    for field_name in TSHARK_FIELDS:
+    for field_name in fields:
         cmd.extend(["-e", field_name])
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     assert proc.stdout is not None
     for line in proc.stdout:
         cols = line.rstrip("\r\n").split("\t")
-        if len(cols) < len(TSHARK_FIELDS):
-            cols.extend([""] * (len(TSHARK_FIELDS) - len(cols)))
-        vals = [c.strip('"') for c in cols[: len(TSHARK_FIELDS)]]
-        d = dict(zip(TSHARK_FIELDS, vals))
-        src_ip = _first(d["ip.src"], d["ipv6.src"])
-        dst_ip = _first(d["ip.dst"], d["ipv6.dst"])
-        src_mac = _first(d["eth.src"], d["wlan.sa"])
-        dst_mac = _first(d["eth.dst"], d["wlan.da"])
-        src_port = _to_int(_first(d["tcp.srcport"], d["udp.srcport"]))
-        dst_port = _to_int(_first(d["tcp.dstport"], d["udp.dstport"]))
-        hostname = _first(d["dhcp.option.hostname"], d["bootp.option.hostname"])
+        if len(cols) < len(fields):
+            cols.extend([""] * (len(fields) - len(cols)))
+        vals = [c.strip('"') for c in cols[: len(fields)]]
+        d = dict(zip(fields, vals))
+
+        src_ip = _first(d.get("ip.src"), d.get("ipv6.src"))
+        dst_ip = _first(d.get("ip.dst"), d.get("ipv6.dst"))
+        src_mac = _first(d.get("eth.src"), d.get("wlan.sa"))
+        dst_mac = _first(d.get("eth.dst"), d.get("wlan.da"))
+        src_port = _to_int(_first(d.get("tcp.srcport"), d.get("udp.srcport")))
+        dst_port = _to_int(_first(d.get("tcp.dstport"), d.get("udp.dstport")))
+        hostname = _first(d.get("dhcp.option.hostname"), d.get("bootp.option.hostname"))
+        protocol = _first(d.get("_ws.col.Protocol"))
+        dns_query = _first(d.get("dns.qry.name"))
+        dns_response = _first(d.get("dns.resp.name"))
+        mdns_name = _first(dns_response, dns_query) if (protocol or "").lower() == "mdns" else None
+
         yield TrafficRecord(
-            observed_at=_iso_from_epoch(d["frame.time_epoch"]),
-            length=_to_int(d["frame.len"]) or 0,
+            observed_at=_iso_from_epoch(d.get("frame.time_epoch")),
+            length=_to_int(d.get("frame.len")) or 0,
             src_mac=src_mac.lower() if src_mac else None,
             dst_mac=dst_mac.lower() if dst_mac else None,
             src_ip=src_ip,
             dst_ip=dst_ip,
             src_port=src_port,
             dst_port=dst_port,
-            protocol=_first(d["_ws.col.Protocol"]),
-            dns_name=_first(d["dns.qry.name"]),
-            tls_sni=_first(d["tls.handshake.extensions_server_name"]),
-            http_host=_first(d["http.host"]),
+            protocol=protocol,
+            dns_name=dns_query or dns_response,
+            tls_sni=_first(d.get("tls.handshake.extensions_server_name")),
+            http_host=_first(d.get("http.host")),
             hostname=hostname,
-            mdns_name=_first(d["mdns.dns_resp_name"]),
-            ssdp_server=_first(d["ssdp.server"]),
-            ssdp_usn=_first(d["ssdp.usn"]),
-            signal_dbm=_to_int(d["radiotap.dbm_antsignal"]),
+            mdns_name=mdns_name,
+            ssdp_server=_first(d.get("ssdp.server")),
+            ssdp_usn=_first(d.get("ssdp.usn")),
+            signal_dbm=_to_int(d.get("radiotap.dbm_antsignal")),
         )
+
     stderr = proc.stderr.read() if proc.stderr else ""
     rc = proc.wait()
     if rc:
