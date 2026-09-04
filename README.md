@@ -1,110 +1,321 @@
-# JackNet
+# Jacknet
 
-JackNet is a pipx-installable LAN inventory and device-fingerprinting CLI. It correlates ARP/MAC, OUI vendor data, PTR hostnames, mDNS/DNS-SD, SSDP/UPnP, Nmap services/OS guesses, and local historical evidence.
+## What we are building
 
-## Install
+Jacknet is a network-observation and device-intelligence tool.
 
-Requires Python 3.11+. Nmap is optional but strongly recommended for deeper service/OS fingerprinting.
+The goal is not to rewrite Nmap, Wireshark, TShark, or other mature networking tools. Jacknet will use them as sensors, combine what they discover, remember it over time, and explain what it knows about each device on the network.
 
-```powershell
-pipx install .
-jacknet init
-jacknet doctor
+The central idea is simple:
+
+> A device is more than its current IP address.
+
+An IP can change. Jacknet should build a persistent dossier from MAC addresses, address history, hostnames, manufacturers, services, protocols, DNS activity, traffic patterns, discovery protocols, and other evidence.
+
+## The architecture
+
+```text
+                       JACKNET
+                          |
+          +---------------+---------------+
+          |               |               |
+        Nmap          PCAP/TShark      LAN discovery
+     active scans     passive traffic   ARP/mDNS/SSDP
+          |               |               |
+          +---------------+---------------+
+                          |
+                    evidence store
+                          |
+                    device identity
+                          |
+               +----------+----------+
+               |                     |
+             history               behavior
 ```
 
-Install directly from an unpacked release directory with `pipx install .`, or from a built wheel with `pipx install dist/jacknet-*.whl`.
+Jacknet's job is correlation and memory.
 
-## First-time initialization
+Nmap is good at actively asking a machine what is exposed. Packet captures are good at showing what machines actually do. ARP, DHCP, DNS, mDNS, SSDP and similar protocols provide identity clues. None of these sources alone tells the whole story.
 
-Default app data lives in `~/.jacknet`:
+Jacknet will join those clues together.
 
-```powershell
-jacknet init
+## Rule #1: evidence before conclusions
+
+Jacknet should never simply say:
+
+```text
+This is an Xbox. Confidence: 97%
 ```
 
-Choose the application-data directory yourself:
+It should be able to explain why:
 
-```powershell
-jacknet init --data-dir D:\JackNetData
+```text
+Likely device: Xbox Series X
+Confidence: 97%
+
+Evidence:
+  MAC vendor       Microsoft
+  DHCP hostname    Xbox
+  DNS activity     Xbox/Microsoft services
+  UDP service      3074 observed
+  Nmap evidence    matching services
+  First seen       2026-09-04
+  Last seen        12 seconds ago
 ```
 
-JackNet stores its database, reports, backups, cache, logs, exports, and learned fingerprints under that directory. The small location pointer is stored separately in `~/.config/jacknet/config.json`. `JACKNET_DATA_DIR` can temporarily override it.
+Every conclusion should be traceable back to observations.
 
-Change it later:
+## Rule #2: observations are history, not disposable scan results
 
-```powershell
-jacknet config --data-dir D:\NetworkTools\JackNet
+A scan should not overwrite what Jacknet knew yesterday.
+
+Jacknet should remember observations with timestamps and sources.
+
+For example:
+
+```text
+DEVICE 17
+  MAC/interface
+    address history
+      192.168.0.37   previous
+      192.168.0.42   current
+
+  evidence
+    Nmap
+    ARP
+    DHCP
+    DNS
+    mDNS
+    SSDP
+    TLS
+    PCAP
 ```
 
-## Scanning
+This lets Jacknet learn a device even when DHCP changes its address.
 
-```powershell
-jacknet scan -A
-jacknet scan -A --verbose
-jacknet scan -A --deep
-jacknet scan --ip 192.168.1.55 --verbose
-jacknet scan -A --man SONY --confidence 70
-jacknet scan -A --type game_console
+## Rule #3: use the best existing tools
+
+We do not need to reinvent packet decoding or port scanning.
+
+Recommended components:
+
+- **Python** — Jacknet itself.
+- **SQLite** — persistent local evidence/history database.
+- **Nmap XML** — active host, port, service and OS evidence.
+- **TShark** — Wireshark's dissector engine for extracting protocol information from captures.
+- **dumpcap** — lightweight packet capture when Jacknet performs live capture.
+- **pcap/pcapng** — standard capture files Jacknet can ingest.
+- **Zeek later** — higher-level connection and behavioral metadata once the foundation works.
+
+Jacknet orchestrates these tools and turns their output into one model of the network.
+
+## Development roadmap
+
+### Phase 1 — Foundation
+
+Build the smallest real Jacknet.
+
+1. Python package with a clean `src/` layout.
+2. Pipx-installable `jacknet` command.
+3. Configuration and application-data directory.
+4. SQLite database.
+5. A device/evidence data model designed before scanners are added.
+6. Commands to initialize and inspect the database.
+
+The important part of Phase 1 is getting identity and evidence storage right. Everything later depends on it.
+
+### Phase 2 — Active discovery with Nmap
+
+Add Nmap as the first sensor.
+
+Jacknet will execute Nmap and consume its XML output rather than scraping terminal text.
+
+We want to learn:
+
+- IP addresses
+- MAC addresses when available
+- manufacturers/OUI
+- open ports
+- detected services
+- service versions
+- OS guesses
+- hostnames
+- scan timestamps
+
+All results become evidence in the database.
+
+### Phase 3 — Local discovery protocols
+
+Add observations from protocols that reveal devices naturally on a LAN:
+
+- ARP
+- reverse DNS
+- mDNS/DNS-SD
+- SSDP/UPnP
+
+These often reveal information that a port scan cannot.
+
+### Phase 4 — PCAP ingestion
+
+Make packet captures a first-class Jacknet input.
+
+```bash
+jacknet ingest traffic.pcapng
 ```
 
-## Reports
+Jacknet will use TShark to extract useful observations such as:
 
-```powershell
-jacknet scan -A --report -o network.jnet
-jacknet scan -A --report --format json -o network.json
-jacknet scan -A --report --format html -o network.html
+- IP/MAC relationships
+- DNS queries
+- protocols used
+- remote endpoints
+- ports
+- traffic volumes
+- DHCP information
+- TLS metadata that is legitimately visible without decrypting payloads
+- timing and connection patterns
+
+The raw capture remains the source; Jacknet stores useful structured observations from it.
+
+### Phase 5 — Device dossiers
+
+Bring all evidence together.
+
+Example command:
+
+```bash
+jacknet explain 192.168.0.42
 ```
 
-Supported report formats: `jnet`, `json`, `txt`, `csv`, `html`.
+The result should show:
 
-## Knowledge and history
+- what Jacknet thinks the device is
+- confidence
+- why it thinks that
+- current and historical addresses
+- services
+- protocols
+- domains/endpoints it normally contacts
+- first/last seen
+- evidence sources
+- user-confirmed identity, if one exists
 
-```powershell
-jacknet manual
-jacknet manual --search playstation
-jacknet history --limit 100
+A user's confirmation should be strong evidence, but we should preserve the observations that led to it.
+
+### Phase 6 — Live passive monitoring
+
+When we have a managed switch with port mirroring, a Raspberry Pi can become a passive Jacknet sensor.
+
+```text
+Internet
+   |
+router
+   |
+managed switch
+   |              \
+network devices    mirrored traffic
+                         |
+                     Raspberry Pi
+                         |
+                 dumpcap / Jacknet
 ```
 
-## Health, repair, and backup
+The Pi does not need to interfere with traffic. The switch sends it copies of packets to observe.
 
-```powershell
-jacknet doctor
-jacknet doctor --fix
-jacknet repair
-jacknet repair --yes
-jacknet backup
-jacknet backup -o D:\Backups\jacknet.db
+Jacknet can continuously ingest those observations into the same database used by active scans.
+
+### Phase 7 — Behavior baselines
+
+Only after Jacknet has reliable historical data should we attempt anomaly detection.
+
+For each device, learn things such as:
+
+- usual protocols
+- usual services
+- common domains/endpoints
+- typical traffic volume
+- normal active hours
+- normal open ports
+- expected peers
+
+Then Jacknet can flag changes rather than blindly labeling traffic malicious.
+
+Example:
+
+```text
+BEHAVIOR CHANGE
+
+Device: Xbox Series X
+
+New observations:
+  TCP/22 now listening
+  previously unseen destination
+  sustained unusual outbound traffic
+
+Reason for alert:
+  these differ significantly from this device's history
 ```
 
-Safe repair behavior:
+The alert must show the evidence that caused it.
 
-- Recreates missing JackNet-owned directories.
-- Creates a missing database and applies schema migrations.
-- Reruns idempotent migrations when the database is healthy.
-- Never silently destroys a corrupt database.
-- `repair --yes` renames a corrupt DB to a timestamped `.corrupt-*.db` file and creates a clean schema.
-- External requirements such as Nmap are reported as user actions rather than modified behind your back.
+### Phase 8 — Zeek and richer network intelligence
 
-## Data model
+Once PCAP ingestion and identity correlation are solid, evaluate Zeek as another sensor.
 
-The current schema includes persistent devices, observations, labels, extracted features, fingerprints, fingerprint features, hypotheses, and corrections. Raw observation payloads are retained so future fingerprint engines can re-evaluate historical scans.
+Zeek can convert packet traffic into structured connection/activity records. Jacknet can correlate those records with the same device dossiers instead of duplicating Zeek's job.
 
-## Pipelines / stdin
+### Phase 9 — Reporting
 
-JackNet accepts IP addresses, hostnames, and CIDRs from stdin. Redirected stdin is detected automatically; `--stdin` is available when explicit behavior is preferred.
+Jacknet should eventually answer useful questions directly:
 
-```powershell
-"192.168.1.55" | jacknet scan
-"192.168.1.55", "192.168.1.72" | jacknet scan --deep
-Get-Content .\\targets.txt | jacknet scan --verbose
-"192.168.1.0/28" | jacknet scan --no-nmap
+```bash
+jacknet devices
+jacknet explain <ip|mac|device-id>
+jacknet history <device>
+jacknet changes
+jacknet traffic <device>
+jacknet report
 ```
 
-Pipeline-friendly output:
+Reports should be readable by a human but backed by structured evidence.
 
-```powershell
-jacknet scan -A --man SONY -c 70 --raw
-jacknet scan -A --json | ConvertFrom-Json
-```
+## What Jacknet is NOT
 
-`--raw` writes only matching IP addresses to stdout. `--json` emits plain JSON to stdout, making both suitable for redirection and composition.
+Jacknet is not intended to:
+
+- replace Wireshark
+- replace Nmap
+- decrypt traffic it does not have keys for
+- perform ARP spoofing just to obtain visibility
+- claim certainty without evidence
+- call every unusual event an attack
+- hide its reasoning behind an unexplained "AI" score
+
+## Security philosophy
+
+Jacknet should prefer passive observation and normal administrative access to the network.
+
+Our own network is the laboratory. We can learn Ethernet, ARP, IP, TCP/UDP, DNS, DHCP, TLS, routing, NAT, VPNs, packet capture, service discovery and network monitoring by implementing each Jacknet sensor and examining the actual evidence it produces.
+
+The project should teach us what the network is doing rather than merely produce colorful output.
+
+## Recommended first milestone
+
+Do **not** start with Nmap or Wireshark yet.
+
+First design the evidence model.
+
+We need to answer these questions correctly:
+
+1. What is a device?
+2. What is an interface?
+3. What is an address?
+4. What is an observation?
+5. How do we record where an observation came from?
+6. How do observations expire without deleting history?
+7. How do we express confidence?
+8. How does a user confirm or correct an identity?
+
+Once those answers are represented cleanly in SQLite, Nmap becomes just the first source feeding evidence into it, and PCAP becomes another.
+
+That is where the new Jacknet should begin.
